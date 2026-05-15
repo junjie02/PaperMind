@@ -1,11 +1,22 @@
 # DeepResearch
 
 DeepResearch is a Claude Code based literature survey runner. Give it a
-research topic and it launches Claude Code workers to search for related papers,
-then stores structured metadata in SQLite.
+research topic and it launches Claude Code workers to gather high-quality
+papers across multiple search directions, stores grouped metadata in SQLite,
+and produces a local artifact for every paper.
 
-The returned metadata includes `arxiv_id`, `title`, `authors`, `abstract`,
-`abs_url`, `pdf_url`, categories, publication date, and BibTeX.
+Papers are **not** restricted to arXiv — workers may return conference papers
+(OpenReview / ACL / NeurIPS / CVPR / ...), journal papers, or other authoritative
+sources, as long as they're relevant and high quality.
+
+Per-paper artifact handling:
+
+- **arXiv papers** → the PDF is downloaded via the arXiv API into `pdfs/`.
+- **Non-arXiv papers** → a Markdown file with the full metadata (title, authors,
+  abstract, overview, BibTeX, source URL, ...) is written into `pdfs/`.
+
+Each invocation is fully independent: a fresh `runs/{timestamp}-{slug}/`
+directory is created containing that run's `papers.db` and `pdfs/` folder.
 
 ## Setup
 
@@ -16,20 +27,15 @@ pip install -e .
 cp .env.example .env
 ```
 
-Edit `.env` and set:
-
-```bash
-DEEPSEEK_API_KEY=sk-your-real-key
-SEARCH_BACKEND=claude
-```
-
-Claude Code must also be installed and authenticated because it is the default
-worker backend.
+Edit `.env` if you need to set proxy or PDF download tuning. Claude Code must
+be installed and authenticated because it is the worker backend. The
+`DEEPSEEK_*` entries are kept as an optional hook for future LLM-based
+post-processing — the default pipeline does not require them.
 
 ## Usage
 
 ```bash
-# Default: Claude Code workers, 30 papers
+# Default: Claude Code workers, 30 papers, auto-generated run dir
 deepresearch "attention mechanisms in vision transformers"
 
 # Smaller test run
@@ -38,85 +44,110 @@ deepresearch "diffusion models for video generation" -n 5
 # Print structured metadata JSON
 deepresearch "large language model reasoning" -n 10 --json
 
-# Resume from an existing SQLite database
-deepresearch "graph neural networks survey" --db gnn.db --resume
+# Specify an output directory explicitly
+deepresearch "graph neural networks survey" --out runs/gnn-survey
 
-# Optional non-agent fallback for quick arXiv-only metadata lookup
-deepresearch "vision transformers" --backend arxiv -n 10 --json
+# Resume from an existing run directory (re-download missing artifacts, top up papers)
+deepresearch "graph neural networks survey" --out runs/gnn-survey --resume
+
+# Skip artifact writing (metadata only)
+deepresearch "vision transformers" -n 5 --skip-pdf
 ```
 
 ### CLI Options
 
 ```text
 -n, --num-papers    Target number of papers (default: 30)
--w, --workers       Parallel Claude Code workers per round (default: 4)
---db                SQLite database path (default: papers.db)
---backend           claude or arxiv (default: claude)
+-w, --workers       Parallel Claude Code workers (default: 1)
+--out               Output directory (default: runs/{timestamp}-{slug}/)
 --json              Print paper metadata as JSON
---resume            Resume from existing database
+--resume            Resume from existing run dir (requires --out)
+--skip-pdf          Skip artifact (PDF/MD) writing stage
 --verbose, -v       Enable debug logging
 ```
 
-For the Claude backend, each round caps the number of active workers by the
-remaining target. Worker paper quotas are split from `-n`; for example,
-`-n 10 -w 4` assigns `[3, 3, 2, 2]` in the first round.
+The run is single-shot: workers are launched once with the user's research
+question and the per-worker quota is derived from `-n` (e.g. `-n 10 -w 4` →
+`[3, 3, 2, 2]`). Workers decide their own sub-directions and search keywords.
+The final console output groups papers by the direction each worker actually
+returned.
 
 ## Architecture
 
 ```text
-User topic
+User research question
   |
   v
-SearchDiversifier (DeepSeek/OpenAI-compatible API)
+Claude Code workers (each free to pick its own sub-directions / keywords)
+  |
+  +-- web search / fetch (arxiv, openreview, acl, ...)
+  +-- structured metadata extraction
   |
   v
-Claude Code workers
-  |
-  +-- web search / fetch
-  +-- arXiv metadata verification
-  +-- JSON metadata output
+Dedup by paper_id + SQLite (runs/<id>/papers.db, grouped by direction)
   |
   v
-Dedup + SQLite
+ArtifactWriter
+  ├─ arXiv → runs/<id>/pdfs/<arxiv_id>.pdf
+  └─ other → runs/<id>/pdfs/<source>-<slug>.md
 ```
 
-`--backend arxiv` is a deterministic fallback that queries the arXiv API
-directly. It is useful for smoke tests or when Claude Code is unavailable, but
-it does not perform the richer agentic search.
+Failed PDF downloads are pushed back to the end of the queue and retried up to
+`PDF_MAX_ATTEMPTS` times.
+
+## Run Directory Layout
+
+```
+runs/
+└── 20260515T134500-attention-in-vision-transformers/
+    ├── papers.db
+    └── pdfs/
+        ├── 1706.03762.pdf
+        ├── 2010.11929.pdf
+        ├── openreview-low-rank-adaptation-of-large-language-models.md
+        └── ...
+```
 
 ## Configuration
 
 ```bash
-DEEPSEEK_API_KEY=sk-your-real-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL=deepseek-v4-pro
-DEEPSEEK_MAX_TOKENS=4096
-DEEPSEEK_JSON_MODE=1
-
-SEARCH_BACKEND=claude
 SEARCH_TIMEOUT=900
 
-# Optional arXiv fallback settings
-ARXIV_TIMEOUT=10
-ARXIV_RETRIES=2
+# Optional: switch the Claude Code worker model (default = Claude Code's default)
+# WORKER_MODEL=claude-haiku-4-5-20251001
+
+# Optional PDF download settings
+PDF_MAX_ATTEMPTS=3
+PDF_RETRY_SLEEP=2.0
+PDF_TIMEOUT=60
 
 # Optional proxy
 HTTP_PROXY=
+
+# Optional OpenAI/DeepSeek-compatible LLM (not used by default; reserved for
+# future post-processing like re-ranking / classification)
+DEEPSEEK_API_KEY=
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
 ## Output Fields
 
 | Field | Purpose |
 |---|---|
-| `arxiv_id` | Normalized arXiv ID, for example `1512.03385` |
+| `paper_id` | Dedup key. `arxiv:<id>` for arXiv papers, `<source>:<hash>` otherwise |
+| `arxiv_id` | arXiv ID when applicable (e.g. `1512.03385`); null for non-arXiv papers |
+| `source` | `arxiv` / `openreview` / `acl` / `neurips` / `cvpr` / `nature` / `web` / ... |
+| `source_url` | Canonical landing page URL |
+| `venue` | Publication venue, e.g. `ICLR 2024` / `arXiv preprint` |
+| `search_direction` | The sub-direction this paper was found under |
 | `title` | Paper title |
-| `authors` | JSON array of author names |
+| `authors` | Author list |
 | `abstract` | Paper abstract |
-| `overview` | Short Chinese summary |
+| `overview` | Short Chinese summary written by the worker |
 | `bibtex` | BibTeX citation |
-| `abs_url` | arXiv abstract URL |
-| `pdf_url` | arXiv PDF URL |
+| `abs_url` / `pdf_url` | URLs (PDF URL optional for non-arXiv) |
+| `artifact_rel_path` | Local path of the downloaded PDF or generated MD file |
 | `published_at` | Published date, `YYYY-MM-DD` |
-| `categories` | arXiv categories |
-| `primary_class` | Primary arXiv category |
-| `relevance_score` | Worker-assessed relevance score |
+| `categories` / `primary_class` | Optional category tags |
+| `relevance_score` | Worker-assessed relevance score (1-5) |

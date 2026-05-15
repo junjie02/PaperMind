@@ -9,6 +9,13 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient:
+    """OpenAI-compatible client (DeepSeek by default).
+
+    Currently no module in this project consumes it — the Claude Code worker
+    handles all reasoning. Kept as a hook for future LLM-driven pre/post
+    processing (e.g. result re-ranking, summarisation, classification).
+    """
+
     def __init__(self, config: Config):
         self.config = config
         self._client: AsyncOpenAI | None = None

@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from deepresearch.dedup import DedupEngine
 from deepresearch.models import PaperRecord
 
 logger = logging.getLogger(__name__)
@@ -15,9 +16,11 @@ LOG_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
 class SearchClient:
-    def __init__(self, max_timeout: int = 900):
+    def __init__(self, max_timeout: int = 900, model: str = ""):
         self.max_timeout = max_timeout
+        self.model = model
         self._call_counter = 0
+        self._dedup = DedupEngine()
         with open(SCHEMA_PATH, encoding="utf-8") as f:
             self._schema_str = json.dumps(json.load(f), ensure_ascii=False)
 
@@ -37,8 +40,10 @@ class SearchClient:
             "--json-schema", self._schema_str,
             "--no-session-persistence",
             "--dangerously-skip-permissions",
-            prompt,
         ]
+        if self.model:
+            claude_cmd.extend(["--model", self.model])
+        claude_cmd.append(prompt)
 
         cmd = ["unbuffer", *claude_cmd] if shutil.which("unbuffer") else claude_cmd
 
@@ -299,12 +304,12 @@ class SearchClient:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "backend": backend,
                 "call_id": call_id,
-                "round_num": task_info.get("round_num", 0),
                 "worker_index": task_info.get("worker_index", 0),
-                "search_direction": task_info.get("search_direction", ""),
+                "research_question": task_info.get("research_question", ""),
                 "duration_ms": duration_ms,
                 "exit_code": exit_code,
                 "input": {
+                    "model": self.model or "(claude-code-default)",
                     "prompt": prompt,
                 },
                 "output": result,
@@ -326,23 +331,47 @@ class SearchClient:
         papers = []
         for item in result.get("papers", []):
             try:
+                title = item.get("title", "").strip()
+                if not title:
+                    logger.warning("跳过无标题条目")
+                    continue
+                arxiv_id_raw = (item.get("arxiv_id") or "").strip()
+                normalized_arxiv = self._dedup.normalize_arxiv_id(arxiv_id_raw) if arxiv_id_raw else None
+                source = (item.get("source") or ("arxiv" if normalized_arxiv else "web")).strip().lower()
+                source_url = (item.get("source_url") or item.get("abs_url") or "").strip()
+                if not source_url and normalized_arxiv:
+                    source_url = f"https://arxiv.org/abs/{normalized_arxiv}"
+                paper_id = self._dedup.compute_paper_id(
+                    arxiv_id=normalized_arxiv,
+                    source=source,
+                    source_url=source_url,
+                    title=title,
+                )
+                if not paper_id:
+                    logger.warning(f"无法计算 paper_id，跳过: {title!r}")
+                    continue
                 p = PaperRecord(
-                    arxiv_id=item["arxiv_id"],
-                    title=item["title"],
+                    paper_id=paper_id,
+                    title=title,
                     authors=item.get("authors", []),
                     abstract=item.get("abstract", ""),
                     overview=item.get("overview", ""),
-                    published_at=item.get("published_at"),
+                    source=source,
+                    source_url=source_url,
+                    venue=item.get("venue") or None,
+                    arxiv_id=normalized_arxiv,
+                    search_direction=task.research_question,
+                    published_at=item.get("published_at") or None,
                     categories=item.get("categories", []),
-                    primary_class=item.get("primary_class"),
+                    primary_class=item.get("primary_class") or None,
                     bibtex=item.get("bibtex", ""),
-                    abs_url=item.get("abs_url", ""),
+                    abs_url=item.get("abs_url", "") or source_url,
                     pdf_url=item.get("pdf_url", ""),
                     relevance_score=item.get("relevance_score", 3),
-                    search_round=task.round_num,
-                    worker_id=f"claude-{task.round_num}-{task.worker_index}",
+                    search_round=1,
+                    worker_id=f"claude-{task.worker_index}",
                 )
                 papers.append(p)
             except Exception as e:
-                logger.warning(f"解析论文条目失败: {e} | {item.get('arxiv_id', '?')}")
+                logger.warning(f"解析论文条目失败: {e} | {item.get('title', '?')}")
         return papers

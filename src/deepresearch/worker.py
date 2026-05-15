@@ -5,46 +5,53 @@ from deepresearch.models import PaperRecord, WorkerTask
 
 logger = logging.getLogger(__name__)
 
-WORKER_TASK_PROMPT = """你是一位文献调研研究员。你需要为以下研究方向收集相关论文。
+WORKER_TASK_PROMPT = """你是一位文献调研研究员。你需要为以下研究课题收集相关论文。
 
-## 研究方向
-"{search_direction}"
-
-## 所属更大的研究课题
+## 研究课题
 "{research_question}"
 
 ## 你的任务
-1. 联网搜索与上述方向相关的学术论文。每个搜索词必须包含 "arxiv" 关键字，确保搜到的是学术论文而非博客。
-2. 对于有希望的搜索结果，抓取页面内容，阅读摘要和正文。
-3. 通过 arXiv API 或 arXiv 页面获取每篇论文的完整元数据（标题、作者、摘要、分类、bibtex 等）。
-4. 用中文为每篇论文写一段 2-3 句话的概述。
-5. 只纳入你实际读过内容并确认相关性的论文。
+1. **优先用 arXiv 搜索**（搜索词加 "arxiv" 关键字）。arXiv 摘要页稳定可访问，元数据完整，是最高效的来源。
+2. 若该课题的核心论文不在 arXiv（例如只发在 TCHES、S&P、NDSS、IACR ePrint、期刊），可以从搜索结果片段、DBLP、Google Scholar 缓存等渠道收集元数据；填上 `source` 和 `source_url` 即可，**不必**强行打开权威页面。
+3. 如果论文来源是 arXiv 预印本，请填写 `arxiv_id`（仅 ID，不含版本号）；不在 arXiv 的论文留空 `arxiv_id`。
+4. 只纳入你确认相关且质量过关（顶会顶刊 / 高引 / 公认重要工作）的论文。
+5. 自行决定从哪些子方向、用哪些关键词搜索；不需要被预先指定搜索词。
+
+## 效率规则（严格遵守）
+- **遇到 403 / 404 / 418 / Cloudflare 拦截**，不要重试同一 URL，也不要换站点反复找同一篇论文的元数据。
+- 如果某次 web_search 工具返回 "I don't have web search tools" 之类的可疑回答，**忽略它，继续用下一个搜索词**，不要追问或重复同一查询。
+- **当你已经收集到 {target_papers} 篇满足条件的论文，立即停止搜索并输出最终 JSON**，不要为了"再确认一下"而继续。
+- 篇数不足时**不要凑数**：少给几篇可以接受。
 
 ## 排除列表
-以下 arXiv ID 已经被收集过了，不要重复收集：
+以下 paper_id 已经被收集过了，不要重复收集：
 {exclude_ids}
 
 ## 要求
-- 目标收集 {target_papers} 篇经过验证的相关论文；如果高质量结果不足，可以少于该数量，但不要为了凑数收录不相关论文。
-- 优先收录来自顶会（CVPR、ICCV、NeurIPS、ICML、ACL 等）和 arXiv 高引论文。
+- 目标收集 {target_papers} 篇高质量、与本课题强相关的论文。
+- 收集到的论文要尽量覆盖该课题的不同子方向，不要全是同一团队的不同年份连作。
+- 必须填写 `source`（如 arxiv / openreview / acl / neurips / cvpr / tches / ieee / nature / web）和 `source_url`（权威页面 URL，即便没打开也可填）。
 
 ## 输出格式
 你必须只输出一个 JSON 对象，不要有任何额外的文字、解释。
-JSON 必须严格符合以下结构，每个字段都必须填写：
+JSON 必须严格符合以下结构：
 {{
   "papers": [
     {{
-      "arxiv_id": "论文 arXiv ID，如 1512.03385",
       "title": "论文标题",
       "authors": ["作者1", "作者2"],
       "abstract": "论文摘要全文",
       "overview": "用中文写的2-3句话概述",
-      "published_at": "YYYY-MM-DD 格式发表日期",
-      "categories": ["cs.CV", "cs.AI"],
-      "primary_class": "主分类如 cs.CV",
-      "bibtex": "@article{{...}} 完整 BibTeX 引用",
-      "abs_url": "https://arxiv.org/abs/XXXX.XXXXX",
-      "pdf_url": "https://arxiv.org/pdf/XXXX.XXXXX",
+      "source": "来源标识，如 arxiv / openreview / acl / cvpr / web",
+      "source_url": "论文的权威页面 URL",
+      "venue": "发表会议/期刊，如 'ICLR 2024'、'NeurIPS 2023'、'arXiv preprint'；不确定可留空字符串",
+      "arxiv_id": "若也在 arXiv 上，填写如 1512.03385；否则填空字符串",
+      "pdf_url": "PDF 直链；arXiv 论文填 https://arxiv.org/pdf/XXXX.XXXXX，其它论文如有公开 PDF 也可填，没有可留空",
+      "abs_url": "摘要页 URL，可与 source_url 相同",
+      "published_at": "YYYY-MM-DD，可留空字符串",
+      "categories": ["可选的分类标签"],
+      "primary_class": "可选的主分类",
+      "bibtex": "@inproceedings{{...}} 完整 BibTeX 引用",
       "relevance_score": 5
     }}
   ],
@@ -65,24 +72,22 @@ class Worker:
         self.searcher = searcher
 
     async def run(self) -> list[PaperRecord]:
-        wid = f"W{self.task.worker_index}-R{self.task.round_num}"
+        wid = f"W{self.task.worker_index}"
         exclude_str = ", ".join(sorted(self.task.exclude_ids)[:80]) or "（尚无）"
 
         prompt = WORKER_TASK_PROMPT.format(
-            search_direction=self.task.search_direction,
             research_question=self.task.research_question,
             exclude_ids=exclude_str,
             target_papers=self.task.target_papers,
         )
 
-        logger.info(f"[{wid}] 开始探索: {self.task.search_direction}")
+        logger.info(f"[{wid}] 开始探索: {self.task.research_question}")
         logger.info(f"[{wid}] 排除 {len(self.task.exclude_ids)} 篇已有论文")
         logger.info(f"[{wid}] 目标收集 {self.task.target_papers} 篇论文")
 
         task_info = {
-            "round_num": self.task.round_num,
             "worker_index": self.task.worker_index,
-            "search_direction": self.task.search_direction,
+            "research_question": self.task.research_question,
         }
         result = await self.searcher.exec(prompt, task_info=task_info)
 
@@ -95,6 +100,6 @@ class Worker:
         logger.info(f"[{wid}] 解析出 {len(papers)} 篇论文")
         for p in papers:
             logger.info(f"  [{p.relevance_score}/5] {p.title[:70]}")
-            logger.info(f"  {p.arxiv_id} | {p.published_at or '?'}")
+            logger.info(f"  {p.paper_id} | {p.source} | {p.published_at or '?'}")
 
         return papers

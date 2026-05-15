@@ -4,24 +4,27 @@
   "properties": {
     "papers": {
       "type": "array",
-      "description": "已验证的相关论文列表",
+      "description": "已验证的相关论文列表（不限于 arXiv）",
       "items": {
         "type": "object",
         "properties": {
-          "arxiv_id": { "type": "string", "description": "arXiv ID，格式如 1512.03385" },
           "title": { "type": "string", "description": "论文标题" },
           "authors": { "type": "array", "items": { "type": "string" }, "description": "作者列表" },
           "abstract": { "type": "string", "description": "论文摘要" },
           "overview": { "type": "string", "description": "用中文写的2-3句话总结" },
-          "published_at": { "type": "string", "description": "发表日期 YYYY-MM-DD" },
-          "categories": { "type": "array", "items": { "type": "string" }, "description": "arXiv 分类" },
-          "primary_class": { "type": "string", "description": "主分类，如 cs.CV" },
+          "source": { "type": "string", "description": "来源标识，如 arxiv / openreview / acl / neurips / cvpr / web" },
+          "source_url": { "type": "string", "description": "论文的权威页面 URL（abs 页或会议官方页）" },
+          "venue": { "type": "string", "description": "发表会议/期刊，可选，例如 ICLR 2024 / NeurIPS 2023 / arXiv preprint" },
+          "arxiv_id": { "type": "string", "description": "若论文也在 arXiv 上，填写 arXiv ID（如 1512.03385），用于触发 PDF 自动下载；否则留空" },
+          "pdf_url": { "type": "string", "description": "PDF 直链，可选；非 arXiv 论文如有公开 PDF 也可填" },
+          "abs_url": { "type": "string", "description": "摘要页 URL，可选，等同 source_url 时可不填" },
+          "published_at": { "type": "string", "description": "发表日期 YYYY-MM-DD，可选" },
+          "categories": { "type": "array", "items": { "type": "string" }, "description": "学科/主题分类，可选" },
+          "primary_class": { "type": "string", "description": "主分类，可选" },
           "bibtex": { "type": "string", "description": "完整的 BibTeX 引用" },
-          "abs_url": { "type": "string", "description": "arXiv 摘要页 URL" },
-          "pdf_url": { "type": "string", "description": "arXiv PDF URL" },
           "relevance_score": { "type": "integer", "minimum": 1, "maximum": 5, "description": "1-5 相关性评分" }
         },
-        "required": ["arxiv_id", "title", "authors", "abstract", "overview", "bibtex", "abs_url", "pdf_url", "relevance_score"]
+        "required": ["title", "authors", "abstract", "overview", "source", "source_url", "bibtex", "relevance_score"]
       }
     },
     "summary": { "type": "string", "description": "本轮搜索的简短总结" },

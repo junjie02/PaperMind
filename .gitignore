@@ -7,3 +7,4 @@ dist/
 build/
 *.db
 data/
+runs/
