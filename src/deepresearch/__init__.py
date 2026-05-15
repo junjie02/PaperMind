@@ -1,4 +1,4 @@
-"""DeepResearch - Automated literature survey agent."""
+"""PaperMind - deepresearch module: automated literature collection agent."""
 
 from deepresearch.models import PaperRecord, WorkerTask
 from deepresearch.orchestrator import Orchestrator

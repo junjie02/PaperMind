@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 # Load .env from project root, then fall back to current directory
 _env_paths = [
-    Path(__file__).resolve().parent.parent.parent / ".env",  # DeepResearch/.env
+    Path(__file__).resolve().parent.parent.parent / ".env",  # PaperMind/.env
     Path(".env"),
 ]
 for p in _env_paths:

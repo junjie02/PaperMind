@@ -1,4 +1,4 @@
-"""DeepResearch outline generator (LangGraph + LangChain)."""
+"""PaperMind outline generator (LangGraph + LangChain)."""
 
 from .graph import build_graph
 from .state import LiRAState

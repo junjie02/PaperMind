@@ -24,6 +24,9 @@ from .prompts import (
     CLUSTER_PROMPT,
     DRAFT_OUTLINE_PROMPT,
     MERGE_OUTLINES_PROMPT,
+    REVIEW_OUTLINE_PROMPT,
+    REVIEWER_SYSTEM_PROMPT,
+    REVISE_OUTLINE_PROMPT,
     WRITER_SYSTEM_PROMPT,
 )
 
@@ -56,6 +59,12 @@ def build_nodes(config: Config, args: Namespace) -> dict:
     )
     draft_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_DRAFT", 0.6))
     merge_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_MERGE", 0.3))
+    review_llm = build_chat_model(
+        config, temperature=_f("OUTLINE_TEMP_REVIEW", 0.2), json_mode=True
+    )
+    revise_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_REVISE", 0.4))
+
+    max_revisions = int(os.getenv("OUTLINE_MAX_REVISIONS", "2"))
 
     def load_papers(state: dict) -> Command:
         db_path = Path(state["in_dir"]) / "papers.db"
@@ -214,7 +223,101 @@ def build_nodes(config: Config, args: Namespace) -> dict:
                 f"# {state['topic']}（自动合并失败的兜底版）\n\n"
                 + outlines_joined
             )
-        return Command(update={"final_outline": merged}, goto="render_references")
+        return Command(update={"final_outline": merged}, goto="review_outline")
+
+    def review_outline(state: dict) -> Command:
+        outline = state["final_outline"]
+        revision_count = state.get("revision_count", 0)
+        paper_titles = "\n".join(f"- {p['title']}" for p in state["papers"])
+
+        user_msg = REVIEW_OUTLINE_PROMPT.format(
+            topic=state["topic"],
+            revision_round=revision_count + 1,
+            outline=outline,
+            n_papers=len(state["papers"]),
+            paper_titles=paper_titles,
+        )
+        logger.info("评审大纲 (第 %d 轮)", revision_count + 1)
+        resp = _invoke_with_one_retry(
+            review_llm,
+            [
+                SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ],
+            label="review",
+        )
+
+        approved = True
+        feedback = ""
+        score = 0
+        if resp:
+            try:
+                review = json.loads(resp)
+                approved = review.get("approved", True)
+                score = review.get("score", 0)
+                feedback = review.get("summary", "")
+                weaknesses = review.get("weaknesses", [])
+                suggestions = review.get("suggestions", [])
+                logger.info(
+                    "评审结果: %s (score=%d/10) — %s",
+                    "通过" if approved else "不通过", score, feedback,
+                )
+                if weaknesses:
+                    logger.info("  问题: %s", weaknesses)
+                if suggestions:
+                    logger.info("  建议: %s", suggestions)
+            except json.JSONDecodeError:
+                logger.warning("评审 JSON 解析失败,视为通过")
+                approved = True
+
+        if approved or revision_count >= max_revisions:
+            if not approved:
+                logger.warning(
+                    "已达最大修订次数 (%d),强制通过", max_revisions
+                )
+            return Command(
+                update={
+                    "review_feedback": feedback,
+                    "messages": [AIMessage(content=f"review: score={score}, approved={approved}")],
+                },
+                goto="render_references",
+            )
+
+        # Rejected: revise the outline
+        logger.info("大纲未通过评审,开始修订 (第 %d → %d 轮)", revision_count + 1, revision_count + 2)
+        weaknesses_str = "\n".join(f"- {w}" for w in (weaknesses if 'weaknesses' in dir() else []))
+        suggestions_str = "\n".join(f"- {s}" for s in (suggestions if 'suggestions' in dir() else []))
+
+        revise_msg = REVISE_OUTLINE_PROMPT.format(
+            topic=state["topic"],
+            n_sections=state["n_sections"],
+            n_subsections=state["n_subsections"],
+            current_outline=outline,
+            score=score,
+            weaknesses=weaknesses_str or "无具体问题",
+            suggestions=suggestions_str or "无具体建议",
+        )
+        revised = _invoke_with_one_retry(
+            revise_llm,
+            [
+                SystemMessage(content=WRITER_SYSTEM_PROMPT),
+                HumanMessage(content=revise_msg),
+            ],
+            label="revise",
+        )
+        if revised is None:
+            logger.error("修订失败,保留原大纲继续")
+            revised = outline
+
+        return Command(
+            update={
+                "final_outline": revised,
+                "revision_count": revision_count + 1,
+                "review_feedback": feedback,
+                "messages": [AIMessage(content=f"revised outline (round {revision_count + 2})")],
+            },
+            goto="review_outline",
+        )
 
     def render_references(state: dict) -> Command:
         papers_by_title = {p["title"]: p for p in state["papers"]}
@@ -282,6 +385,7 @@ def build_nodes(config: Config, args: Namespace) -> dict:
         "group_by_direction": group_by_direction,
         "draft_per_group": draft_per_group,
         "merge_outlines": merge_outlines,
+        "review_outline": review_outline,
         "render_references": render_references,
     }
 

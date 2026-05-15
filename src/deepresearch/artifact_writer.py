@@ -32,7 +32,7 @@ class ArtifactWriter:
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.pdf_timeout, connect=min(config.pdf_timeout, 10.0)),
             follow_redirects=True,
-            headers={"User-Agent": "DeepResearch/0.1 (mailto:research@example.com)"},
+            headers={"User-Agent": "PaperMind/0.1 (mailto:research@example.com)"},
             **extra,
         )
 

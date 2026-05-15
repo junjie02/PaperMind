@@ -1,153 +1,188 @@
-# DeepResearch
+# PaperMind
 
-DeepResearch is a Claude Code based literature survey runner. Give it a
-research topic and it launches Claude Code workers to gather high-quality
-papers across multiple search directions, stores grouped metadata in SQLite,
-and produces a local artifact for every paper.
+PaperMind is an automated literature survey tool. Give it a research topic and
+it collects papers via Claude Code, downloads PDFs, clusters them by sub-topic,
+and drafts a structured literature review outline — all in one command.
 
-Papers are **not** restricted to arXiv — workers may return conference papers
-(OpenReview / ACL / NeurIPS / CVPR / ...), journal papers, or other authoritative
-sources, as long as they're relevant and high quality.
-
-Per-paper artifact handling:
-
-- **arXiv papers** → the PDF is downloaded via the arXiv API into `pdfs/`.
-- **Non-arXiv papers** → a Markdown file with the full metadata (title, authors,
-  abstract, overview, BibTeX, source URL, ...) is written into `pdfs/`.
-
-Each invocation is fully independent: a fresh `runs/{timestamp}-{slug}/`
-directory is created containing that run's `papers.db` and `pdfs/` folder.
-
-## Setup
+## Quick Start
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -e .
 cp .env.example .env
+# Edit .env: set DEEPSEEK_API_KEY (for outline generation)
 ```
 
-Edit `.env` if you need to set proxy or PDF download tuning. Claude Code must
-be installed and authenticated because it is the worker backend. The
-`DEEPSEEK_*` entries are kept as an optional hook for future LLM-based
-post-processing — the default pipeline does not require them.
+Claude Code must be installed and authenticated (it's the search worker).
 
-## Usage
+## One-Command Usage (PM)
 
 ```bash
-# Default: Claude Code workers, 30 papers, auto-generated run dir
-deepresearch "attention mechanisms in vision transformers"
+# Full pipeline: search 15 papers + download PDFs + generate outline
+PM "agent 安全研究" -n 15
 
-# Smaller test run
-deepresearch "diffusion models for video generation" -n 5
+# More papers, 2 parallel workers
+PM "diffusion models for video generation" -n 30 -w 2
 
-# Print structured metadata JSON
-deepresearch "large language model reasoning" -n 10 --json
+# Only collect papers, skip outline
+PM "vision transformers" -n 10 --skip-outline
 
-# Specify an output directory explicitly
-deepresearch "graph neural networks survey" --out runs/gnn-survey
-
-# Resume from an existing run directory (re-download missing artifacts, top up papers)
-deepresearch "graph neural networks survey" --out runs/gnn-survey --resume
-
-# Skip artifact writing (metadata only)
-deepresearch "vision transformers" -n 5 --skip-pdf
+# Only metadata, skip PDF download too
+PM "LLM reasoning" -n 20 --skip-pdf --skip-outline
 ```
 
-### CLI Options
+### PM Options
 
 ```text
--n, --num-papers    Target number of papers (default: 30)
--w, --workers       Parallel Claude Code workers (default: 1)
---out               Output directory (default: runs/{timestamp}-{slug}/)
---json              Print paper metadata as JSON
---resume            Resume from existing run dir (requires --out)
---skip-pdf          Skip artifact (PDF/MD) writing stage
---verbose, -v       Enable debug logging
+positional:
+  question              Research topic
+
+options:
+  -n, --num-papers N    Target paper count (default: 30)
+  -w, --workers N       Parallel Claude Code workers (default: 1)
+  --out DIR             Output directory (default: runs/{timestamp}-{slug}/)
+  --skip-pdf            Skip PDF/MD artifact download
+  --skip-outline        Skip outline generation (papers only)
+  -s, --sections N      Outline target sections (default: 8)
+  --subsections N       Subsections per section (default: 2)
+  --verbose, -v         Debug logging
 ```
 
-The run is single-shot: workers are launched once with the user's research
-question and the per-worker quota is derived from `-n` (e.g. `-n 10 -w 4` →
-`[3, 3, 2, 2]`). Workers decide their own sub-directions and search keywords.
-The final console output groups papers by the direction each worker actually
-returned.
+## Split-Step Usage
+
+You can also run each phase independently:
+
+### Step 1: Collect papers
+
+```bash
+deepresearch "agent 安全研究" -n 15
+# → runs/20260515T140000-agent-安全研究/papers.db + pdfs/
+```
+
+### Step 2: Generate outline (from an existing run)
+
+```bash
+outline --in runs/20260515T140000-agent-安全研究
+# → runs/20260515T140000-agent-安全研究/outline.md
+```
+
+### deepresearch options
+
+```text
+-n, --num-papers N    Target paper count (default: 30)
+-w, --workers N       Parallel Claude Code workers (default: 1)
+--out DIR             Output directory
+--json                Print metadata as JSON
+--resume              Resume from existing run dir (requires --out)
+--skip-pdf            Skip PDF/MD download
+--verbose, -v         Debug logging
+```
+
+### outline options
+
+```text
+--in DIR              Input run directory (required, must contain papers.db)
+--out FILE            Output file (default: {in_dir}/outline.md)
+--force               Overwrite existing outline
+--recluster           Force re-clustering even if DB already has groups
+-s, --sections N      Target sections (default: 8)
+--subsections N       Subsections per section (default: 2)
+--topic TEXT          Override topic (default: derived from dir name)
+--verbose, -v         Debug logging
+```
 
 ## Architecture
 
 ```text
-User research question
-  |
-  v
-Claude Code workers (each free to pick its own sub-directions / keywords)
-  |
-  +-- web search / fetch (arxiv, openreview, acl, ...)
-  +-- structured metadata extraction
-  |
-  v
-Dedup by paper_id + SQLite (runs/<id>/papers.db, grouped by direction)
-  |
-  v
-ArtifactWriter
-  ├─ arXiv → runs/<id>/pdfs/<arxiv_id>.pdf
-  └─ other → runs/<id>/pdfs/<source>-<slug>.md
+PM "research topic" -n 15
+  │
+  ├─ Phase 1: deepresearch (Claude Code)
+  │    │
+  │    ├── Claude Code workers → web search + metadata extraction
+  │    ├── Dedup → SQLite (papers.db)
+  │    └── ArtifactWriter
+  │         ├─ arXiv papers → pdfs/{arxiv_id}.pdf
+  │         └─ Other papers → pdfs/{source}-{slug}.md
+  │
+  └─ Phase 2: outline (LangGraph + DeepSeek)
+       │
+       ├── cluster_papers    (1 LLM call: group papers by sub-topic)
+       ├── group_by_direction (pure Python: bucket + sort)
+       ├── draft_per_group   (G LLM calls: one sub-outline per group)
+       ├── merge_outlines    (1 LLM call: merge into final outline)
+       └── render_references (pure Python: extract citations → bibtex)
+       │
+       └── → outline.md
 ```
-
-Failed PDF downloads are pushed back to the end of the queue and retried up to
-`PDF_MAX_ATTEMPTS` times.
 
 ## Run Directory Layout
 
 ```
 runs/
-└── 20260515T134500-attention-in-vision-transformers/
-    ├── papers.db
+└── 20260515T140000-agent-安全研究/
+    ├── papers.db          # SQLite with all paper metadata
+    ├── outline.md         # Generated literature review outline
     └── pdfs/
-        ├── 1706.03762.pdf
-        ├── 2010.11929.pdf
-        ├── openreview-low-rank-adaptation-of-large-language-models.md
+        ├── 2301.12345.pdf
+        ├── 2405.67890.pdf
+        ├── openreview-some-paper-title.md
         └── ...
 ```
 
-## Configuration
+## Configuration (.env)
 
 ```bash
+# Claude Code worker model (leave empty for default Opus)
+WORKER_MODEL=claude-haiku-4-5-20251001
+
+# Search timeout per worker (seconds)
 SEARCH_TIMEOUT=900
 
-# Optional: switch the Claude Code worker model (default = Claude Code's default)
-# WORKER_MODEL=claude-haiku-4-5-20251001
-
-# Optional PDF download settings
+# PDF download
 PDF_MAX_ATTEMPTS=3
 PDF_RETRY_SLEEP=2.0
 PDF_TIMEOUT=60
 
-# Optional proxy
+# HTTP proxy
 HTTP_PROXY=
 
-# Optional OpenAI/DeepSeek-compatible LLM (not used by default; reserved for
-# future post-processing like re-ranking / classification)
-DEEPSEEK_API_KEY=
+# LLM for outline generation (OpenAI-compatible)
+DEEPSEEK_API_KEY=sk-your-key
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MAX_TOKENS=4096
+DEEPSEEK_JSON_MODE=1
+
+# Outline temperature tuning (optional)
+# OUTLINE_TEMP_CLUSTER=0.1
+# OUTLINE_TEMP_DRAFT=0.6
+# OUTLINE_TEMP_MERGE=0.3
+# OUTLINE_CLUSTER_MAX=6
 ```
 
-## Output Fields
+## Output Fields (papers.db)
 
 | Field | Purpose |
 |---|---|
-| `paper_id` | Dedup key. `arxiv:<id>` for arXiv papers, `<source>:<hash>` otherwise |
-| `arxiv_id` | arXiv ID when applicable (e.g. `1512.03385`); null for non-arXiv papers |
-| `source` | `arxiv` / `openreview` / `acl` / `neurips` / `cvpr` / `nature` / `web` / ... |
-| `source_url` | Canonical landing page URL |
-| `venue` | Publication venue, e.g. `ICLR 2024` / `arXiv preprint` |
-| `search_direction` | The sub-direction this paper was found under |
+| `paper_id` | Dedup key: `arxiv:<id>` or `<source>:<hash>` |
 | `title` | Paper title |
 | `authors` | Author list |
 | `abstract` | Paper abstract |
-| `overview` | Short Chinese summary written by the worker |
+| `overview` | Chinese summary by worker |
+| `source` | `arxiv` / `openreview` / `acl` / `neurips` / ... |
+| `source_url` | Canonical URL |
+| `venue` | Publication venue |
+| `arxiv_id` | arXiv ID (null for non-arXiv) |
+| `search_direction` | Sub-topic cluster label |
 | `bibtex` | BibTeX citation |
-| `abs_url` / `pdf_url` | URLs (PDF URL optional for non-arXiv) |
-| `artifact_rel_path` | Local path of the downloaded PDF or generated MD file |
-| `published_at` | Published date, `YYYY-MM-DD` |
-| `categories` / `primary_class` | Optional category tags |
-| `relevance_score` | Worker-assessed relevance score (1-5) |
+| `pdf_url` | PDF direct link |
+| `artifact_rel_path` | Local PDF or MD path |
+| `relevance_score` | 1-5 relevance rating |
+
+## Future Roadmap
+
+The LangGraph pipeline has seams for:
+- **Reviewer node** — LLM-as-judge evaluates outline quality, loops back to re-draft if rejected
+- **RAG content writer** — FAISS + embeddings retrieve relevant paper sections per outline chapter
+- **Polish step** — final language and citation cleanup

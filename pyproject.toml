@@ -1,7 +1,7 @@
 [project]
-name = "deepresearch"
+name = "papermind"
 version = "0.1.0"
-description = "Automated literature survey agent with multi-worker parallel search"
+description = "Automated literature survey + outline generation (Claude Code + LangGraph)"
 requires-python = ">=3.12"
 dependencies = [
     "openai>=1.0.0",
@@ -17,10 +17,11 @@ dependencies = [
 [project.scripts]
 deepresearch = "deepresearch.main:main"
 outline = "outliner.main:main"
+PM = "papermind.main:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/deepresearch", "src/outliner"]
+packages = ["src/deepresearch", "src/outliner", "src/papermind"]
