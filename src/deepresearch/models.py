@@ -29,5 +29,6 @@ class PaperRecord(BaseModel):
 class WorkerTask(BaseModel):
     research_question: str
     exclude_ids: list[str] = Field(default_factory=list)
+    exclude_titles: list[str] = Field(default_factory=list)
     worker_index: int = 0
     target_papers: int = 3

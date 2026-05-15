@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from pathlib import Path
 
 from deepresearch.artifact_writer import ArtifactWriter
@@ -39,6 +40,7 @@ class Orchestrator:
     ) -> list[PaperRecord]:
         target = target_count or self.config.default_target
         workers = workers_per_round or self.config.workers_per_round
+        per_round = self.config.papers_per_round
 
         await self.db.initialize()
 
@@ -50,40 +52,59 @@ class Orchestrator:
                 p = PaperRecord(**p_dict)
                 paper_set[p.paper_id] = p
 
+        planned_rounds = math.ceil(target / per_round)
         logger.info(
-            f"开始调研: '{research_question}'  目标={target}  Worker={workers} (单轮模式)"
+            "开始调研: '%s'  目标=%d  每轮=%d  计划轮数=%d  Worker/轮=%d",
+            research_question, target, per_round, planned_rounds, workers,
         )
 
-        all_exclude = set(paper_set.keys()) | existing_ids
-        remaining = max(target - len(paper_set), 0)
+        round_num = 0
+        while True:
+            round_num += 1
+            is_planned = round_num <= planned_rounds
+            all_exclude = set(paper_set.keys()) | existing_ids
 
-        if remaining == 0:
-            logger.info("目标已满足（已有 %d 篇），跳过检索阶段", len(paper_set))
-        else:
-            quotas = self._allocate_worker_targets(remaining, workers)
+            if len(paper_set) >= target and is_planned:
+                logger.info("目标已满足（%d/%d），跳过剩余计划轮次", len(paper_set), target)
+                break
 
+            logger.info(
+                "=== 第 %d 轮 (%s) | 已有 %d 篇 | 排除 %d 个 ID ===",
+                round_num,
+                "计划内" if is_planned else "补充",
+                len(paper_set),
+                len(all_exclude),
+            )
+
+            quotas = self._allocate_worker_targets(per_round, workers)
             tasks = []
+            exclude_list = sorted(all_exclude)
+            exclude_titles = [
+                paper_set[pid].title if pid in paper_set else ""
+                for pid in exclude_list
+            ]
             for i in range(workers):
                 task = WorkerTask(
                     research_question=research_question,
-                    exclude_ids=sorted(all_exclude),
+                    exclude_ids=exclude_list,
+                    exclude_titles=exclude_titles,
                     worker_index=i,
                     target_papers=quotas[i],
                 )
                 tasks.append(Worker(task, self.searcher).run())
 
-            logger.info(f"启动 {len(tasks)} 个 Worker，配额: {quotas}")
+            logger.info("启动 %d 个 Worker，配额: %s", len(tasks), quotas)
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             new_count = 0
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    logger.warning(f"Worker {i} 异常: {result}")
+                    logger.warning("Worker %d 异常: %s", i, result)
                     continue
                 for paper in result:
                     pid = paper.paper_id
                     if not pid:
-                        logger.warning(f"论文缺少 paper_id，跳过: {paper.title!r}")
+                        logger.warning("论文缺少 paper_id，跳过: %r", paper.title)
                         continue
                     if pid in paper_set or pid in existing_ids:
                         continue
@@ -91,17 +112,21 @@ class Orchestrator:
                     try:
                         await self.db.upsert(paper)
                     except Exception as e:
-                        logger.error(f"入库失败 {pid}: {e}")
+                        logger.error("入库失败 %s: %s", pid, e)
                         continue
                     new_count += 1
 
-            logger.info(f"单轮完成: +{new_count} 篇, 累计 {len(paper_set)}/{target}")
-            for i, result in enumerate(results):
-                if isinstance(result, list):
-                    ids = [p.paper_id for p in result]
-                    logger.info(f"  Worker {i}: {len(result)} 篇 → {ids}")
+            logger.info("第 %d 轮完成: +%d 篇, 累计 %d/%d", round_num, new_count, len(paper_set), target)
 
-        logger.info(f"调研结束: {len(paper_set)} 篇论文（单轮）")
+            if not is_planned and new_count == 0:
+                logger.info("补充轮无新增，停止搜索")
+                break
+
+            if not is_planned and len(paper_set) >= target:
+                logger.info("目标已满足，停止搜索")
+                break
+
+        logger.info("调研结束: %d 篇论文（共 %d 轮）", len(paper_set), round_num)
         self._log_direction_summary(paper_set.values())
         papers = list(paper_set.values())
         await self._maybe_write_artifacts(papers, skip_pdf)

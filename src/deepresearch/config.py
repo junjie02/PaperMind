@@ -32,6 +32,15 @@ class Config:
     pdf_retry_sleep: float = field(default_factory=lambda: float(os.getenv("PDF_RETRY_SLEEP", "2.0")))
     pdf_timeout: float = field(default_factory=lambda: float(os.getenv("PDF_TIMEOUT", "60")))
 
+    # Writer phase (Phase 3)
+    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"))
+    writer_model: str = field(default_factory=lambda: os.getenv("WRITER_MODEL", ""))
+    write_timeout: int = field(default_factory=lambda: int(os.getenv("WRITE_TIMEOUT", "1800")))
+    writer_concurrency: int = field(default_factory=lambda: int(os.getenv("WRITER_CONCURRENCY", "4")))
+    writer_max_retries: int = field(default_factory=lambda: int(os.getenv("WRITER_MAX_RETRIES", "3")))
+
+    papers_per_round: int = field(default_factory=lambda: int(os.getenv("PAPERS_PER_ROUND", "10")))
+
     default_target: int = 30
     workers_per_round: int = 1
     db_path: str = ""

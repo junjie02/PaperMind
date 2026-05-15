@@ -35,6 +35,23 @@ def update_search_direction(db_path: Path, paper_id: str, direction: str) -> Non
         conn.close()
 
 
+def count_papers(db_path: Path) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def load_paper_titles(db_path: Path) -> dict[str, str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute("SELECT paper_id, title FROM papers").fetchall()
+        return {r[0]: r[1] for r in rows}
+    finally:
+        conn.close()
+
+
 def distinct_directions(db_path: Path) -> set[str]:
     conn = sqlite3.connect(str(db_path))
     try:

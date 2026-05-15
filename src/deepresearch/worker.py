@@ -73,7 +73,16 @@ class Worker:
 
     async def run(self) -> list[PaperRecord]:
         wid = f"W{self.task.worker_index}"
-        exclude_str = ", ".join(sorted(self.task.exclude_ids)[:80]) or "（尚无）"
+
+        if self.task.exclude_ids:
+            pairs = list(zip(self.task.exclude_ids, self.task.exclude_titles or []))
+            lines = [
+                f"- {pid}  {title}" if title else f"- {pid}"
+                for pid, title in pairs
+            ]
+            exclude_str = "\n".join(lines)
+        else:
+            exclude_str = "（尚无）"
 
         prompt = WORKER_TASK_PROMPT.format(
             research_question=self.task.research_question,

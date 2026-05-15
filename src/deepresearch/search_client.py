@@ -218,12 +218,13 @@ class SearchClient:
     def _parse_stdout_json(self, text: str) -> dict:
         """从 Claude Code stdout 提取 JSON 结果。
 
-        Claude --output-format json 每行一个 JSON 事件。
-        result 字段中可能包含：裸 JSON、markdown 代码块、或混合文本。
+        优先从所有 assistant 事件拼接完整文本（不受 result 字段长度限制），
+        fallback 到 result 事件的 result 字段。
         """
-        result_candidates = []
+        assistant_texts: list[str] = []
         result_text = ""
-        for line in reversed(text.strip().splitlines()):
+
+        for line in text.strip().splitlines():
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -231,27 +232,31 @@ class SearchClient:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") == "result" and "result" in event:
-                result_text = event["result"]
-                result_candidates.append(result_text)
-                break
-            if event.get("type") == "assistant":
+
+            ev_type = event.get("type", "")
+            if ev_type == "assistant":
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") == "text" and block.get("text"):
-                        result_candidates.append(block["text"])
+                        assistant_texts.append(block["text"])
+            elif ev_type == "result" and "result" in event:
+                result_text = event["result"]
 
-        if not result_candidates:
-            logger.error(f"Claude 输出中未找到 type=result 事件: {text[:500]}")
+        # Build candidates: full assistant text first, then result field as fallback
+        full_assistant = "".join(assistant_texts)
+        candidates = [c for c in [full_assistant, result_text] if c.strip()]
+
+        if not candidates:
+            logger.error("Claude 输出中未找到任何文本内容: %s", text[:500])
             return {"papers": [], "summary": "parse error", "search_queries_used": []}
 
         errors = []
-        for candidate in result_candidates:
+        for candidate in candidates:
             parsed, error = self._parse_json_candidate(candidate)
             if parsed is not None:
                 return parsed
             errors.append(error)
 
-        logger.error(f"Claude result 解析失败: {result_text[:500]} | errors={errors[:3]}")
+        logger.error("Claude result 解析失败: %s | errors=%s", full_assistant[:500], errors[:3])
         return {"papers": [], "summary": "parse error", "search_queries_used": []}
 
     def _parse_json_candidate(self, text: str) -> tuple[dict | None, str]:
@@ -276,7 +281,43 @@ class SearchClient:
             if isinstance(parsed, dict):
                 return parsed, ""
 
+        # JSON was truncated — salvage complete paper objects from the papers array
+        salvaged = self._salvage_truncated_papers(cleaned)
+        if salvaged is not None:
+            logger.warning("JSON truncated; salvaged %d papers", len(salvaged.get("papers", [])))
+            return salvaged, ""
+
         return None, locals().get("last_error", "no JSON object found")
+
+    def _salvage_truncated_papers(self, text: str) -> dict | None:
+        """Extract complete paper objects from a truncated JSON papers array."""
+        array_start = text.find('"papers"')
+        if array_start == -1:
+            return None
+        bracket = text.find("[", array_start)
+        if bracket == -1:
+            return None
+
+        papers = []
+        decoder = json.JSONDecoder()
+        pos = bracket + 1
+        while pos < len(text):
+            # skip whitespace and commas
+            while pos < len(text) and text[pos] in " \t\n\r,":
+                pos += 1
+            if pos >= len(text) or text[pos] != "{":
+                break
+            try:
+                obj, end_pos = decoder.raw_decode(text, pos)
+                papers.append(obj)
+                pos += end_pos - pos
+            except json.JSONDecodeError:
+                break
+
+        if not papers:
+            return None
+        return {"papers": papers, "summary": "salvaged from truncated output", "search_queries_used": []}
+
 
     def _strip_markdown_fence(self, text: str) -> str:
         cleaned = text.strip()

@@ -1,7 +1,7 @@
 [project]
 name = "papermind"
-version = "0.1.0"
-description = "Automated literature survey + outline generation (Claude Code + LangGraph)"
+version = "0.2.0"
+description = "Automated literature survey + outline generation + review writing (Claude Code + LangGraph + RAG)"
 requires-python = ">=3.12"
 dependencies = [
     "openai>=1.0.0",
@@ -12,11 +12,15 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain-openai>=0.2.0",
     "langchain-core>=0.3.0",
+    "pymupdf>=1.25.0",
+    "sentence-transformers>=3.0.0",
+    "faiss-cpu>=1.7.4",
 ]
 
 [project.scripts]
 deepresearch = "deepresearch.main:main"
 outline = "outliner.main:main"
+write = "outliner.writer_main:main"
 PM = "papermind.main:main"
 
 [build-system]

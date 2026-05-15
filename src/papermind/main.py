@@ -53,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="每章节子节数 (默认: 2)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="开启 DEBUG 日志")
+    parser.add_argument("--skip-write", action="store_true",
+                        help="跳过综述正文写作（Phase 3）")
     return parser
 
 
@@ -127,6 +129,36 @@ def _run_outline(run_dir: Path, topic: str, sections: int, subsections: int) -> 
         return False
 
 
+def _run_write(run_dir: Path) -> bool:
+    """Phase 3: write full review via DeepSeek concurrent writers + RAG."""
+    from deepresearch.config import Config
+
+    from outliner.db import count_papers
+    from outliner.indexer import build_index_from_run
+    from outliner.review_orchestrator import ReviewOrchestrator
+
+    config = Config()
+    outline = (run_dir / "outline.md").read_text(encoding="utf-8")
+
+    try:
+        build_index_from_run(run_dir, embedding_model=config.embedding_model)
+    except ValueError as e:
+        logger.warning("跳过综述写作: %s", e)
+        return False
+
+    n_papers = count_papers(run_dir / "papers.db")
+    orchestrator = ReviewOrchestrator(config, run_dir)
+    review_md = asyncio.run(orchestrator.write_review(outline, n_papers))
+
+    if review_md:
+        (run_dir / "review.md").write_text(review_md, encoding="utf-8")
+        logger.info("综述已生成: %s", run_dir / "review.md")
+        return True
+    else:
+        logger.error("综述写作失败")
+        return False
+
+
 def _resolve_run_dir(out: str | None, question: str) -> Path:
     from deepresearch.text_utils import slugify
 
@@ -174,6 +206,18 @@ def main():
         logger.info("=" * 50)
         _run_outline(run_dir, args.question, args.sections, args.subsections)
 
+    # Phase 3: 综述写作
+    outline_path = run_dir / "outline.md"
+    if args.skip_outline or args.skip_write:
+        logger.info("跳过综述写作 (--skip-write)")
+    elif not outline_path.exists():
+        logger.warning("outline.md 不存在，跳过综述写作")
+    else:
+        logger.info("=" * 50)
+        logger.info("Phase 3: 综述写作 (DeepSeek + FAISS RAG)")
+        logger.info("=" * 50)
+        _run_write(run_dir)
+
     # 最终汇总
     print(f"\n{'=' * 60}")
     print(f"PaperMind 完成")
@@ -183,6 +227,9 @@ def main():
     outline_path = run_dir / "outline.md"
     if outline_path.exists():
         print(f"大纲:     {outline_path}")
+    review_path = run_dir / "review.md"
+    if review_path.exists():
+        print(f"综述:     {review_path}")
     print(f"{'=' * 60}")
 
 

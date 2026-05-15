@@ -1,8 +1,6 @@
 # PaperMind
 
-PaperMind is an automated literature survey tool. Give it a research topic and
-it collects papers via Claude Code, downloads PDFs, clusters them by sub-topic,
-and drafts a structured literature review outline — all in one command.
+PaperMind is an automated literature survey tool. Give it a research topic and it collects papers via Claude Code, downloads PDFs, clusters them by sub-topic, drafts a structured outline, and writes a full literature review — all in one command.
 
 ## Quick Start
 
@@ -11,25 +9,25 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -e .
 cp .env.example .env
-# Edit .env: set DEEPSEEK_API_KEY (for outline generation)
+# Edit .env: set DEEPSEEK_API_KEY
 ```
 
-Claude Code must be installed and authenticated (it's the search worker).
+Claude Code must be installed and authenticated (used as the paper search worker).
 
 ## One-Command Usage (PM)
 
 ```bash
-# Full pipeline: search 15 papers + download PDFs + generate outline
+# Full pipeline: search + outline + write review
 PM "agent 安全研究" -n 15
 
-# More papers, 2 parallel workers
+# More papers, 2 parallel search workers
 PM "diffusion models for video generation" -n 30 -w 2
 
-# Only collect papers, skip outline
-PM "vision transformers" -n 10 --skip-outline
+# Skip review writing
+PM "vision transformers" -n 10 --skip-write
 
-# Only metadata, skip PDF download too
-PM "LLM reasoning" -n 20 --skip-pdf --skip-outline
+# Only collect papers
+PM "LLM reasoning" -n 20 --skip-outline
 ```
 
 ### PM Options
@@ -44,6 +42,7 @@ options:
   --out DIR             Output directory (default: runs/{timestamp}-{slug}/)
   --skip-pdf            Skip PDF/MD artifact download
   --skip-outline        Skip outline generation (papers only)
+  --skip-write          Skip review writing (Phase 3)
   -s, --sections N      Outline target sections (default: 8)
   --subsections N       Subsections per section (default: 2)
   --verbose, -v         Debug logging
@@ -51,21 +50,34 @@ options:
 
 ## Split-Step Usage
 
-You can also run each phase independently:
+Each phase can be run independently.
 
-### Step 1: Collect papers
+### Phase 1: Collect papers
 
 ```bash
 deepresearch "agent 安全研究" -n 15
 # → runs/20260515T140000-agent-安全研究/papers.db + pdfs/
 ```
 
-### Step 2: Generate outline (from an existing run)
+### Phase 2: Generate outline
 
 ```bash
 outline --in runs/20260515T140000-agent-安全研究
-# → runs/20260515T140000-agent-安全研究/outline.md
+# → runs/.../outline.md
 ```
+
+### Phase 3: Write review
+
+```bash
+# Build FAISS index from PDFs
+write index --in runs/20260515T140000-agent-安全研究
+
+# Write review (reuse existing index)
+write write --in runs/20260515T140000-agent-安全研究 --skip-index
+# → runs/.../review.md
+```
+
+The two `write` sub-commands can be run separately, which is useful for debugging or re-running just the writing step without re-embedding.
 
 ### deepresearch options
 
@@ -73,8 +85,6 @@ outline --in runs/20260515T140000-agent-安全研究
 -n, --num-papers N    Target paper count (default: 30)
 -w, --workers N       Parallel Claude Code workers (default: 1)
 --out DIR             Output directory
---json                Print metadata as JSON
---resume              Resume from existing run dir (requires --out)
 --skip-pdf            Skip PDF/MD download
 --verbose, -v         Debug logging
 ```
@@ -85,10 +95,24 @@ outline --in runs/20260515T140000-agent-安全研究
 --in DIR              Input run directory (required, must contain papers.db)
 --out FILE            Output file (default: {in_dir}/outline.md)
 --force               Overwrite existing outline
---recluster           Force re-clustering even if DB already has groups
+--recluster           Force re-clustering
 -s, --sections N      Target sections (default: 8)
 --subsections N       Subsections per section (default: 2)
---topic TEXT          Override topic (default: derived from dir name)
+--topic TEXT          Override topic
+--verbose, -v         Debug logging
+```
+
+### write options
+
+```text
+# index sub-command
+--in DIR              Run directory (required)
+
+# write sub-command
+--in DIR              Run directory (required)
+--skip-index          Skip embedding, reuse existing faiss.index
+--model MODEL         Override WRITER_MODEL for this run
+--out FILE            Output path (default: {in_dir}/review.md)
 --verbose, -v         Debug logging
 ```
 
@@ -97,23 +121,32 @@ outline --in runs/20260515T140000-agent-安全研究
 ```text
 PM "research topic" -n 15
   │
-  ├─ Phase 1: deepresearch (Claude Code)
-  │    │
-  │    ├── Claude Code workers → web search + metadata extraction
+  ├─ Phase 1: deepresearch (Claude Code workers)
+  │    ├── Web search + metadata extraction
   │    ├── Dedup → SQLite (papers.db)
   │    └── ArtifactWriter
-  │         ├─ arXiv papers → pdfs/{arxiv_id}.pdf
-  │         └─ Other papers → pdfs/{source}-{slug}.md
+  │         ├─ arXiv → pdfs/{arxiv_id}.pdf
+  │         └─ Other → pdfs/{source}-{slug}.md
   │
-  └─ Phase 2: outline (LangGraph + DeepSeek)
+  ├─ Phase 2: outline (LangGraph + DeepSeek)
+  │    ├── cluster_papers     (group by sub-topic)
+  │    ├── draft_per_group    (sub-outline per cluster)
+  │    ├── merge_outlines     (merge into final outline)
+  │    └── → outline.md
+  │
+  └─ Phase 3: write (DeepSeek concurrent writers + FAISS RAG)
+       ├── pdf_converter      (PyMuPDF: PDF → text)
+       ├── chunker            (section-aware splitting)
+       ├── indexer            (sentence-transformers → faiss.index)
        │
-       ├── cluster_papers    (1 LLM call: group papers by sub-topic)
-       ├── group_by_direction (pure Python: bucket + sort)
-       ├── draft_per_group   (G LLM calls: one sub-outline per group)
-       ├── merge_outlines    (1 LLM call: merge into final outline)
-       └── render_references (pure Python: extract citations → bibtex)
-       │
-       └── → outline.md
+       └── Per ## section (concurrent):
+            ├── Dual-path retrieval
+            │    ├── Path A: direct vector search (title + outline text)
+            │    └── Path B: LLM keyword expansion → vector search
+            ├── DeepSeek write (draft with citations)
+            ├── RAG verify     (re-retrieve on draft → fact-check)
+            └── Loop until PASS or max_retries
+            → review.md
 ```
 
 ## Run Directory Layout
@@ -121,44 +154,46 @@ PM "research topic" -n 15
 ```
 runs/
 └── 20260515T140000-agent-安全研究/
-    ├── papers.db          # SQLite with all paper metadata
-    ├── outline.md         # Generated literature review outline
+    ├── papers.db          # SQLite: all paper metadata
+    ├── outline.md         # Literature review outline
+    ├── review.md          # Full literature review (Phase 3 output)
+    ├── faiss.index        # FAISS vector index
+    ├── chunks.pkl         # Serialized paper chunks
     └── pdfs/
         ├── 2301.12345.pdf
-        ├── 2405.67890.pdf
-        ├── openreview-some-paper-title.md
+        ├── openreview-some-paper.md
         └── ...
 ```
 
 ## Configuration (.env)
 
 ```bash
-# Claude Code worker model (leave empty for default Opus)
+# DeepSeek API (used for outline + review writing)
+DEEPSEEK_API_KEY=sk-your-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MAX_TOKENS=4096
+
+# Claude Code worker model (Phase 1 paper search)
 WORKER_MODEL=claude-haiku-4-5-20251001
 
-# Search timeout per worker (seconds)
-SEARCH_TIMEOUT=900
+# HTTP proxy
+HTTP_PROXY=http://127.0.0.1:7890
+
+# Embedding model (CPU-friendly HuggingFace model)
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+
+# Writer settings (all default to DEEPSEEK_* values if left empty)
+WRITER_MODEL=              # leave empty to use DEEPSEEK_MODEL
+WRITER_CONCURRENCY=4       # parallel section writers
+WRITER_MAX_RETRIES=3       # write→verify→rewrite loops per section
+WRITE_TIMEOUT=1800
 
 # PDF download
 PDF_MAX_ATTEMPTS=3
 PDF_RETRY_SLEEP=2.0
 PDF_TIMEOUT=60
-
-# HTTP proxy
-HTTP_PROXY=
-
-# LLM for outline generation (OpenAI-compatible)
-DEEPSEEK_API_KEY=sk-your-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_MAX_TOKENS=4096
-DEEPSEEK_JSON_MODE=1
-
-# Outline temperature tuning (optional)
-# OUTLINE_TEMP_CLUSTER=0.1
-# OUTLINE_TEMP_DRAFT=0.6
-# OUTLINE_TEMP_MERGE=0.3
-# OUTLINE_CLUSTER_MAX=6
+SEARCH_TIMEOUT=900
 ```
 
 ## Output Fields (papers.db)
@@ -167,22 +202,13 @@ DEEPSEEK_JSON_MODE=1
 |---|---|
 | `paper_id` | Dedup key: `arxiv:<id>` or `<source>:<hash>` |
 | `title` | Paper title |
-| `authors` | Author list |
+| `authors` | Author list (JSON) |
 | `abstract` | Paper abstract |
-| `overview` | Chinese summary by worker |
-| `source` | `arxiv` / `openreview` / `acl` / `neurips` / ... |
+| `overview` | Summary by search worker |
+| `source` | `arxiv` / `openreview` / `acl` / ... |
 | `source_url` | Canonical URL |
 | `venue` | Publication venue |
 | `arxiv_id` | arXiv ID (null for non-arXiv) |
-| `search_direction` | Sub-topic cluster label |
 | `bibtex` | BibTeX citation |
-| `pdf_url` | PDF direct link |
 | `artifact_rel_path` | Local PDF or MD path |
-| `relevance_score` | 1-5 relevance rating |
-
-## Future Roadmap
-
-The LangGraph pipeline has seams for:
-- **Reviewer node** — LLM-as-judge evaluates outline quality, loops back to re-draft if rejected
-- **RAG content writer** — FAISS + embeddings retrieve relevant paper sections per outline chapter
-- **Polish step** — final language and citation cleanup
+| `relevance_score` | 1–5 relevance rating |
