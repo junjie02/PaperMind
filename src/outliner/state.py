@@ -19,6 +19,8 @@ class LiRAState(MessagesState):
     cluster_skipped_reason: str
     paper_groups: list[dict]
     group_outlines: list[str]
+    chapter_plan: list[dict]
+    survey_title: str
     final_outline: str
     references_md: str
     output_path: str

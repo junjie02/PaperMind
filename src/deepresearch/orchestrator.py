@@ -64,8 +64,8 @@ class Orchestrator:
             is_planned = round_num <= planned_rounds
             all_exclude = set(paper_set.keys()) | existing_ids
 
-            if len(paper_set) >= target and is_planned:
-                logger.info("目标已满足（%d/%d），跳过剩余计划轮次", len(paper_set), target)
+            if len(paper_set) >= target:
+                logger.info("目标已满足（%d/%d），停止搜索", len(paper_set), target)
                 break
 
             logger.info(
@@ -120,10 +120,6 @@ class Orchestrator:
 
             if not is_planned and new_count == 0:
                 logger.info("补充轮无新增，停止搜索")
-                break
-
-            if not is_planned and len(paper_set) >= target:
-                logger.info("目标已满足，停止搜索")
                 break
 
         logger.info("调研结束: %d 篇论文（共 %d 轮）", len(paper_set), round_num)

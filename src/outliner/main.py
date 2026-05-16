@@ -103,6 +103,8 @@ def main():
         "cluster_assignments": [],
         "cluster_skipped_reason": "",
         "paper_groups": [],
+        "chapter_plan": [],
+        "survey_title": "",
         "group_outlines": [],
         "final_outline": "",
         "references_md": "",

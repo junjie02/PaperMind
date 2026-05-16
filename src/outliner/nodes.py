@@ -9,7 +9,10 @@ import json
 import logging
 import os
 import re
+import time
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -24,6 +27,7 @@ from .prompts import (
     CLUSTER_PROMPT,
     DRAFT_OUTLINE_PROMPT,
     MERGE_OUTLINES_PROMPT,
+    PLAN_CHAPTERS_PROMPT,
     REVIEW_OUTLINE_PROMPT,
     REVIEWER_SYSTEM_PROMPT,
     REVISE_OUTLINE_PROMPT,
@@ -55,8 +59,9 @@ def _truncate(text: str, n: int) -> str:
 
 def build_nodes(config: Config, args: Namespace) -> dict:
     cluster_llm = build_chat_model(
-        config, temperature=_f("OUTLINE_TEMP_CLUSTER", 0.1), json_mode=True
+        config, temperature=_f("OUTLINE_TEMP_CLUSTER", 0.1)
     )
+    plan_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_PLAN", 0.1))
     draft_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_DRAFT", 0.6))
     merge_llm = build_chat_model(config, temperature=_f("OUTLINE_TEMP_MERGE", 0.3))
     review_llm = build_chat_model(
@@ -123,13 +128,30 @@ def build_nodes(config: Config, args: Namespace) -> dict:
             paper_lines=paper_lines,
         )
         logger.info("调用 LLM 聚类 %d 篇论文", len(papers))
-        resp = cluster_llm.invoke(
-            [
-                SystemMessage(content="你是文献分类助手。仅返回合法 JSON。"),
-                HumanMessage(content=user_msg),
-            ]
+        messages = [
+            SystemMessage(content="你是文献分类助手。仅返回合法 JSON。非MarkDown格式"),
+            HumanMessage(content=user_msg),
+        ]
+        assignments = group_names = None
+        started_at = time.monotonic()
+        for attempt in range(1, 4):
+            resp = cluster_llm.invoke(messages)
+            assignments, group_names = _parse_cluster_json(resp.content, papers, state["topic"])
+            if len(group_names) > 1:
+                break
+            if attempt < 3:
+                logger.warning("聚类第 %d 次尝试解析失败，重试", attempt)
+        assignments = assignments or [{"paper_id": p["paper_id"], "direction": state["topic"]} for p in papers]
+        group_names = group_names or [state["topic"]]
+
+        _save_cluster_log(
+            topic=state["topic"],
+            model=config.llm_model,
+            prompt=user_msg,
+            response=resp.content,
+            group_names=group_names,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
         )
-        assignments, group_names = _parse_cluster_json(resp.content, papers, state["topic"])
 
         for a in assignments:
             db.update_search_direction(db_path, a["paper_id"], a["direction"])
@@ -164,40 +186,156 @@ def build_nodes(config: Config, args: Namespace) -> dict:
         for g in result:
             logger.info("  · [%s] %d 篇", g["direction"], len(g["papers"]))
 
-        return Command(update={"paper_groups": result}, goto="draft_per_group")
+        return Command(update={"paper_groups": result}, goto="plan_chapters")
+
+    def plan_chapters(state: dict) -> Command:
+        groups = state["paper_groups"]
+        groups_block = "\n\n".join(
+            "## {}\n{}".format(
+                g["direction"],
+                "\n".join(
+                    f"- {p['paper_id']} | {p['title']} | {_truncate(p.get('overview', ''), 150)}"
+                    for p in g["papers"]
+                ),
+            )
+            for g in groups
+        )
+        user_msg = PLAN_CHAPTERS_PROMPT.format(
+            topic=state["topic"],
+            n_sections=state["n_sections"],
+            n_subsections=state["n_subsections"],
+            groups_block=groups_block,
+        )
+        logger.info("规划章节结构 (%d 个子主题)", len(groups))
+        messages = [
+            SystemMessage(content="你是文献综述结构规划专家。仅返回合法 JSON。"),
+            HumanMessage(content=user_msg),
+        ]
+        chapter_plan: list[dict] = []
+        survey_title = state["topic"]
+        for attempt in range(1, 4):
+            resp = _invoke_with_one_retry(plan_llm, messages, label="plan_chapters")
+            if not resp:
+                if attempt < 3:
+                    logger.warning("章节规划第 %d 次调用失败，重试", attempt)
+                continue
+            try:
+                text = resp.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```[^\n]*\n?", "", text)
+                    text = re.sub(r"\n?```\s*$", "", text)
+                data = json.loads(text)
+                chapter_plan = data.get("chapters", [])
+                survey_title = data.get("title", state["topic"]) or state["topic"]
+                if chapter_plan:
+                    break
+            except (json.JSONDecodeError, KeyError):
+                if attempt < 3:
+                    logger.warning("章节规划 JSON 解析失败 (第 %d 次)，重试", attempt)
+
+        if not chapter_plan:
+            logger.warning("章节规划失败，回退到按子主题直接起草")
+            chapter_plan = [
+                {"title": g["direction"], "directions": [g["direction"]]}
+                for g in groups
+            ]
+
+        logger.info("章节规划完成: %d 章，综述标题: %s", len(chapter_plan), survey_title)
+        for ch in chapter_plan:
+            logger.info("  · %s → %s", ch["title"], ch.get("directions", []))
+
+        return Command(update={"chapter_plan": chapter_plan, "survey_title": survey_title}, goto="draft_per_group")
 
     def draft_per_group(state: dict) -> Command:
-        outlines: list[str] = []
-        sections_per_group = max(2, state["n_sections"] // max(len(state["paper_groups"]), 1))
+        groups = state["paper_groups"]
+        chapter_plan = state["chapter_plan"]
+        groups_by_direction = {g["direction"]: g for g in groups}
 
-        for grp in state["paper_groups"]:
+        # Map each chapter to its primary paper group (first matching direction)
+        def _find_group(direction: str) -> dict | None:
+            if direction in groups_by_direction:
+                return groups_by_direction[direction]
+            # fuzzy fallback: find group whose name contains or is contained by direction
+            dl = direction.lower()
+            for name, grp in groups_by_direction.items():
+                nl = name.lower()
+                if dl in nl or nl in dl:
+                    return grp
+            # last resort: longest common substring match
+            best, best_len = None, 0
+            for name, grp in groups_by_direction.items():
+                common = sum(1 for a, b in zip(direction, name) if a == b)
+                if common > best_len:
+                    best, best_len = grp, common
+            return best
+
+        def _papers_for_chapter(chapter: dict) -> list[dict]:
+            for direction in chapter.get("directions", []):
+                grp = _find_group(direction)
+                if grp:
+                    return grp["papers"]
+            # collect from all matching directions, dedup
+            seen_ids: set[str] = set()
+            papers: list[dict] = []
+            for direction in chapter.get("directions", []):
+                grp = _find_group(direction)
+                if grp:
+                    for p in grp["papers"]:
+                        if p["paper_id"] not in seen_ids:
+                            seen_ids.add(p["paper_id"])
+                            papers.append(p)
+            return papers
+
+        # Only draft non-Introduction/Conclusion chapters
+        draft_chapters = [
+            ch for ch in chapter_plan
+            if ch["title"].lower() not in {"introduction", "conclusion"}
+        ]
+
+        def _draft_one(chapter: dict) -> tuple[int, str]:
+            idx = draft_chapters.index(chapter)
+            papers = _papers_for_chapter(chapter)
             paper_blocks = "\n\n".join(
                 f"### {p['title']}\n"
                 f"- overview: {_truncate(p.get('overview', ''), 300)}\n"
                 f"- abstract: {_truncate(p.get('abstract', ''), 400)}"
-                for p in grp["papers"]
-            )
+                for p in papers
+            ) or "（本章节暂无对应论文）"
+            subsections = chapter.get("subsections") or []
+            subsections_block = "\n".join(f"- {s}" for s in subsections) or "（由你自行规划）"
             user_msg = DRAFT_OUTLINE_PROMPT.format(
                 topic=state["topic"],
-                direction=grp["direction"],
-                n_sections=sections_per_group,
-                n_subsections=state["n_subsections"],
+                chapter_title=chapter["title"],
+                subsections_block=subsections_block,
                 paper_blocks=paper_blocks,
             )
             messages = [
                 SystemMessage(content=WRITER_SYSTEM_PROMPT),
                 HumanMessage(content=user_msg),
             ]
-
+            started_at = time.monotonic()
             outline = _invoke_with_one_retry(
-                draft_llm, messages, label=f"draft[{grp['direction']}]"
+                draft_llm, messages, label=f"draft[{chapter['title']}]"
             )
             if outline is None:
-                outline = (
-                    f"# {grp['direction']}\n\n_本组未能成功起草（LLM 调用失败）_\n"
-                )
-            outlines.append(outline)
+                outline = f"# {chapter['title']}\n\n_本章节未能成功起草（LLM 调用失败）_\n"
+            _save_draft_log(
+                chapter_title=chapter["title"],
+                model=config.llm_model,
+                prompt=user_msg,
+                response=outline,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            return idx, outline
 
+        outlines_map: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=len(draft_chapters) or 1) as pool:
+            futures = {pool.submit(_draft_one, ch): ch for ch in draft_chapters}
+            for fut in as_completed(futures):
+                idx, outline = fut.result()
+                outlines_map[idx] = outline
+
+        outlines = [outlines_map[i] for i in range(len(draft_chapters))]
         logger.info("起草完成: %d 段子大纲", len(outlines))
         return Command(update={"group_outlines": outlines}, goto="merge_outlines")
 
@@ -237,65 +375,68 @@ def build_nodes(config: Config, args: Namespace) -> dict:
             n_papers=len(state["papers"]),
             paper_titles=paper_titles,
         )
+        review_messages = [
+            SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ]
         logger.info("评审大纲 (第 %d 轮)", revision_count + 1)
-        resp = _invoke_with_one_retry(
-            review_llm,
-            [
-                SystemMessage(content=REVIEWER_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ],
-            label="review",
-        )
 
         approved = True
         feedback = ""
-        score = 0
-        if resp:
-            try:
-                review = json.loads(resp)
-                approved = review.get("approved", True)
-                score = review.get("score", 0)
-                feedback = review.get("summary", "")
-                weaknesses = review.get("weaknesses", [])
-                suggestions = review.get("suggestions", [])
-                logger.info(
-                    "评审结果: %s (score=%d/10) — %s",
-                    "通过" if approved else "不通过", score, feedback,
-                )
-                if weaknesses:
-                    logger.info("  问题: %s", weaknesses)
-                if suggestions:
-                    logger.info("  建议: %s", suggestions)
-            except json.JSONDecodeError:
-                logger.warning("评审 JSON 解析失败,视为通过")
+        resp = None
+
+        started_at = time.monotonic()
+        for attempt in range(1, 4):
+            resp = _invoke_with_one_retry(review_llm, review_messages, label="review")
+            if not resp:
+                if attempt < 3:
+                    logger.warning("评审第 %d 次调用失败，重试", attempt)
+                continue
+            sufficient, feedback = _parse_review_json(resp)
+            if sufficient is not None:
+                approved = sufficient
+                logger.info("评审结果: %s", "通过" if approved else "不通过")
+                if feedback:
+                    logger.info("  反馈: %s", feedback[:200])
+                break
+            if attempt < 3:
+                logger.warning("评审 JSON 解析失败 (第 %d 次)，重试", attempt)
+            else:
+                logger.warning("评审 JSON 解析失败，视为通过")
                 approved = True
+
+        _save_review_log(
+            topic=state["topic"],
+            model=config.llm_model,
+            revision_count=revision_count,
+            prompt=user_msg,
+            response=resp or "",
+            approved=approved,
+            score=0,
+            feedback=feedback,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
 
         if approved or revision_count >= max_revisions:
             if not approved:
-                logger.warning(
-                    "已达最大修订次数 (%d),强制通过", max_revisions
-                )
+                logger.warning("已达最大修订次数 (%d),强制通过", max_revisions)
             return Command(
                 update={
                     "review_feedback": feedback,
-                    "messages": [AIMessage(content=f"review: score={score}, approved={approved}")],
+                    "messages": [AIMessage(content=f"review: approved={approved}")],
                 },
                 goto="render_references",
             )
 
         # Rejected: revise the outline
         logger.info("大纲未通过评审,开始修订 (第 %d → %d 轮)", revision_count + 1, revision_count + 2)
-        weaknesses_str = "\n".join(f"- {w}" for w in (weaknesses if 'weaknesses' in dir() else []))
-        suggestions_str = "\n".join(f"- {s}" for s in (suggestions if 'suggestions' in dir() else []))
 
         revise_msg = REVISE_OUTLINE_PROMPT.format(
             topic=state["topic"],
             n_sections=state["n_sections"],
             n_subsections=state["n_subsections"],
             current_outline=outline,
-            score=score,
-            weaknesses=weaknesses_str or "无具体问题",
-            suggestions=suggestions_str or "无具体建议",
+            feedback=feedback or "无具体反馈",
         )
         revised = _invoke_with_one_retry(
             revise_llm,
@@ -361,8 +502,9 @@ def build_nodes(config: Config, args: Namespace) -> dict:
             logger.warning("有 %d 个引用在 papers.db 中未找到: %s", len(missing), missing)
 
         out_path = Path(args.out) if args.out else Path(state["in_dir"]) / "outline.md"
+        survey_title = state.get("survey_title") or state["topic"]
         full = (
-            f"# {state['topic']}\n\n"
+            f"# {survey_title}\n\n"
             + state["final_outline"].strip()
             + "\n\n"
             + references_md
@@ -383,11 +525,102 @@ def build_nodes(config: Config, args: Namespace) -> dict:
         "load_papers": load_papers,
         "cluster_papers": cluster_papers,
         "group_by_direction": group_by_direction,
+        "plan_chapters": plan_chapters,
         "draft_per_group": draft_per_group,
         "merge_outlines": merge_outlines,
         "review_outline": review_outline,
         "render_references": render_references,
     }
+
+
+_LOG_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def _save_cluster_log(
+    topic: str,
+    model: str,
+    prompt: str,
+    response: str,
+    group_names: list[str],
+    duration_ms: int,
+) -> None:
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        filename = _LOG_DIR / f"cluster-{ts}.json"
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "topic": topic,
+            "duration_ms": duration_ms,
+            "input": {"model": model, "prompt": prompt},
+            "output": {"raw": response, "group_names": group_names},
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=2)
+        logger.info("聚类日志已保存: %s", filename)
+    except Exception as e:
+        logger.warning("保存聚类日志失败: %s", e)
+
+
+def _save_draft_log(
+    chapter_title: str,
+    model: str,
+    prompt: str,
+    response: str,
+    duration_ms: int,
+) -> None:
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        safe_title = re.sub(r"[^\w一-鿿-]", "_", chapter_title)[:30]
+        filename = _LOG_DIR / f"draft-{ts}-{safe_title}.json"
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "chapter_title": chapter_title,
+            "duration_ms": duration_ms,
+            "input": {"model": model, "prompt": prompt},
+            "output": {"draft": response},
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=2)
+        logger.info("起草日志已保存: %s", filename)
+    except Exception as e:
+        logger.warning("保存起草日志失败: %s", e)
+
+
+def _save_review_log(
+    topic: str,
+    model: str,
+    revision_count: int,
+    prompt: str,
+    response: str,
+    approved: bool,
+    score: int,
+    feedback: str,
+    duration_ms: int,
+) -> None:
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        filename = _LOG_DIR / f"review-{ts}-r{revision_count}.json"
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "topic": topic,
+            "revision_count": revision_count,
+            "duration_ms": duration_ms,
+            "input": {"model": model, "prompt": prompt},
+            "output": {
+                "raw": response,
+                "approved": approved,
+                "score": score,
+                "feedback": feedback,
+            },
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=2)
+        logger.info("评审日志已保存: %s", filename)
+    except Exception as e:
+        logger.warning("保存评审日志失败: %s", e)
 
 
 def _invoke_with_one_retry(llm, messages, *, label: str) -> str | None:
@@ -402,12 +635,31 @@ def _invoke_with_one_retry(llm, messages, *, label: str) -> str | None:
         return None
 
 
+def _parse_review_json(text: str) -> tuple[bool | None, str]:
+    """Parse new-format review JSON. Returns (sufficient, feedback) or (None, '') on failure."""
+    try:
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[^\n]*\n?", "", raw)
+            raw = re.sub(r"\n?```\s*$", "", raw)
+        review = json.loads(raw)
+        sufficient = str(review.get("SUFFICIENT", "yes")).strip().lower() == "yes"
+        feedback = review.get("FEEDBACK", "")
+        return sufficient, feedback
+    except Exception:
+        return None, ""
+
+
 def _parse_cluster_json(
     raw: str, papers: list[dict], fallback_direction: str
 ) -> tuple[list[dict], list[str]]:
     """Parse the cluster LLM output. On any failure, return one big group."""
     try:
-        data = json.loads(raw)
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[^\n]*\n?", "", text)
+            text = re.sub(r"\n?```\s*$", "", text)
+        data = json.loads(text)
         groups = data.get("groups", [])
         valid_ids = {p["paper_id"] for p in papers}
         assignments: list[dict] = []
