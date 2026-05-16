@@ -1,214 +1,110 @@
 # PaperMind
 
-PaperMind is an automated literature survey tool. Give it a research topic and it collects papers via Claude Code, downloads PDFs, clusters them by sub-topic, drafts a structured outline, and writes a full literature review — all in one command.
+自动化文献综述生成工具。主 Agent（LangGraph）编排多个并发 Sub-Agent，完成从方向探索、论文挖掘、写作、评审到润色的全流程。
 
-## Quick Start
+## 架构
+
+```
+PM "topic" -n 30
+     │
+     ▼
+主 Agent (LangGraph + MiniMax)
+     │
+     ├── Phase 1: Explorer Sub-Agent × 3-5  ──→ DDG 搜索 + 网页抓取
+     │             （背景调研，3轮迭代，自主决定搜索/抓取/结束）
+     │
+     ├── Phase 2: 主 Agent 生成大纲 + 分配文献数量
+     │             （输出 outline.md，按重要性为每个 sub_question 分配目标篇数）
+     │
+     ├── Phase 3: Researcher Sub-Agent × N  ──→ DDG 搜索 + 网页抓取 + PDF 下载
+     │             （针对性收集论文，达到目标数量即停止，最多12轮）
+     │
+     ├── Phase 4: Build Index ──→ PDF 提取 / 元数据 fallback → FAISS 向量索引
+     │
+     ├── Phase 5: Writer Sub-Agent × N      ──→ RAG 检索 + 事实核查循环
+     │
+     ├── Phase 6: Reviewer Sub-Agent × N    ──→ 质量评审
+     │
+     └── Phase 7: Polisher Sub-Agent × N    ──→ 润色 + 一致性检查 + 合并输出
+```
+
+- **搜索工具**：DDG 搜索 + trafilatura 网页抓取（`src/mcp_servers/ddg_search.py`）
+- **RAG 检索**：FAISS + sentence-transformers（`src/mcp_servers/rag_retrieval.py`）
+- **LLM**：MiniMax（OpenAI 兼容 API），所有 Agent 共用
+- **向量模型**：`all-MiniLM-L6-v2`
+
+## 安装
 
 ```bash
-python3 -m venv venv
+python -m venv venv
 source venv/bin/activate
 pip install -e .
+```
+
+## 配置
+
+```bash
 cp .env.example .env
-# Edit .env: set DEEPSEEK_API_KEY
+# 编辑 .env，填入 OPENAI_API_KEY 和代理地址
 ```
 
-Claude Code must be installed and authenticated (used as the paper search worker).
+关键环境变量：
 
-## One-Command Usage (PM)
+| 变量 | 说明 |
+|------|------|
+| `OPENAI_API_KEY` | MiniMax / DeepSeek / OpenAI API Key |
+| `OPENAI_BASE_URL` | API 地址（默认 MiniMax） |
+| `OPENAI_MODEL` | 模型名称（默认 `MiniMax-M2.7`） |
+| `HTTP_PROXY` | DDG 搜索和 PDF 下载代理 |
+| `MAX_CONCURRENT_AGENTS` | 最大并发 Sub-Agent 数（默认 4，实际由主 Agent 决定，硬上限 3） |
+
+## 使用
 
 ```bash
-# Full pipeline: search + outline + write review
+# 生成文献综述
 PM "agent 安全研究" -n 15
+PM "diffusion models for video" -n 30
 
-# More papers, 2 parallel search workers
-PM "diffusion models for video generation" -n 30 -w 2
+# 指定输出目录
+PM "vision transformers" --out runs/my-run
 
-# Skip review writing
-PM "vision transformers" -n 10 --skip-write
+# 从已有运行目录的某个阶段恢复（跳过前面的阶段）
+PM "LLM 推理加速" --out runs/20260516T145202-llm-推理加速 --resume build_index
+PM "LLM 推理加速" --out runs/20260516T145202-llm-推理加速 --resume write_sections
 
-# Only collect papers
-PM "LLM reasoning" -n 20 --skip-outline
+# 开启 DEBUG 日志
+PM "topic" -v
 ```
 
-### PM Options
+可用的恢复阶段：`explore_directions`、`synthesize_outline`、`research_sections`、`check_coverage`、`build_index`、`write_sections`、`review_sections`、`polish_sections`、`check_consistency`、`merge_final`
 
-```text
-positional:
-  question              Research topic
-
-options:
-  -n, --num-papers N    Target paper count (default: 30)
-  -w, --workers N       Parallel Claude Code workers (default: 1)
-  --out DIR             Output directory (default: runs/{timestamp}-{slug}/)
-  --skip-pdf            Skip PDF/MD artifact download
-  --skip-outline        Skip outline generation (papers only)
-  --skip-write          Skip review writing (Phase 3)
-  -s, --sections N      Outline target sections (default: 8)
-  --subsections N       Subsections per section (default: 2)
-  --verbose, -v         Debug logging
-```
-
-## Split-Step Usage
-
-Each phase can be run independently.
-
-### Phase 1: Collect papers
-
-```bash
-deepresearch "agent 安全研究" -n 15
-# → runs/20260515T140000-agent-安全研究/papers.db + pdfs/
-```
-
-### Phase 2: Generate outline
-
-```bash
-outline --in runs/20260515T140000-agent-安全研究
-# → runs/.../outline.md
-```
-
-### Phase 3: Write review
-
-```bash
-# Build FAISS index from PDFs
-write index --in runs/20260515T140000-agent-安全研究
-
-# Write review (reuse existing index)
-write write --in runs/20260515T140000-agent-安全研究 --skip-index
-# → runs/.../review.md
-```
-
-The two `write` sub-commands can be run separately, which is useful for debugging or re-running just the writing step without re-embedding.
-
-### deepresearch options
-
-```text
--n, --num-papers N    Target paper count (default: 30)
--w, --workers N       Parallel Claude Code workers (default: 1)
---out DIR             Output directory
---skip-pdf            Skip PDF/MD download
---verbose, -v         Debug logging
-```
-
-### outline options
-
-```text
---in DIR              Input run directory (required, must contain papers.db)
---out FILE            Output file (default: {in_dir}/outline.md)
---force               Overwrite existing outline
---recluster           Force re-clustering
--s, --sections N      Target sections (default: 8)
---subsections N       Subsections per section (default: 2)
---topic TEXT          Override topic
---verbose, -v         Debug logging
-```
-
-### write options
-
-```text
-# index sub-command
---in DIR              Run directory (required)
-
-# write sub-command
---in DIR              Run directory (required)
---skip-index          Skip embedding, reuse existing faiss.index
---model MODEL         Override WRITER_MODEL for this run
---out FILE            Output path (default: {in_dir}/review.md)
---verbose, -v         Debug logging
-```
-
-## Architecture
-
-```text
-PM "research topic" -n 15
-  │
-  ├─ Phase 1: deepresearch (Claude Code workers)
-  │    ├── Web search + metadata extraction
-  │    ├── Dedup → SQLite (papers.db)
-  │    └── ArtifactWriter
-  │         ├─ arXiv → pdfs/{arxiv_id}.pdf
-  │         └─ Other → pdfs/{source}-{slug}.md
-  │
-  ├─ Phase 2: outline (LangGraph + DeepSeek)
-  │    ├── cluster_papers     (group by sub-topic)
-  │    ├── draft_per_group    (sub-outline per cluster)
-  │    ├── merge_outlines     (merge into final outline)
-  │    └── → outline.md
-  │
-  └─ Phase 3: write (DeepSeek concurrent writers + FAISS RAG)
-       ├── pdf_converter      (PyMuPDF: PDF → text)
-       ├── chunker            (section-aware splitting)
-       ├── indexer            (sentence-transformers → faiss.index)
-       │
-       └── Per ## section (concurrent):
-            ├── Dual-path retrieval
-            │    ├── Path A: direct vector search (title + outline text)
-            │    └── Path B: LLM keyword expansion → vector search
-            ├── DeepSeek write (draft with citations)
-            ├── RAG verify     (re-retrieve on draft → fact-check)
-            └── Loop until PASS or max_retries
-            → review.md
-```
-
-## Run Directory Layout
+## 输出目录结构
 
 ```
-runs/
-└── 20260515T140000-agent-安全研究/
-    ├── papers.db          # SQLite: all paper metadata
-    ├── outline.md         # Literature review outline
-    ├── review.md          # Full literature review (Phase 3 output)
-    ├── faiss.index        # FAISS vector index
-    ├── chunks.pkl         # Serialized paper chunks
-    └── pdfs/
-        ├── 2301.12345.pdf
-        ├── openreview-some-paper.md
-        └── ...
+runs/{timestamp}-{slug}/
+├── papers.db          # 论文元数据（SQLite）
+├── pdfs/              # PDF 文件 + 无 PDF 论文的 MD 元数据文件
+├── faiss.index        # FAISS 向量索引
+├── chunks.pkl         # 文本分块缓存
+├── outline.md         # 研究大纲（含每个问题的目标文献数）
+├── data/              # 完整 Agent I/O 日志（JSON）
+│   ├── main_agent.json
+│   ├── explorer-*.json
+│   ├── explorer-*_iterations.json
+│   ├── researcher-*.json
+│   ├── researcher-*_iterations.json
+│   └── ...
+└── survey.md          # 最终综述
 ```
 
-## Configuration (.env)
+## 目录结构
 
-```bash
-# DeepSeek API (used for outline + review writing)
-DEEPSEEK_API_KEY=sk-your-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_MAX_TOKENS=4096
-
-# Claude Code worker model (Phase 1 paper search)
-WORKER_MODEL=claude-haiku-4-5-20251001
-
-# HTTP proxy
-HTTP_PROXY=http://127.0.0.1:7890
-
-# Embedding model (CPU-friendly HuggingFace model)
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-
-# Writer settings (all default to DEEPSEEK_* values if left empty)
-WRITER_MODEL=              # leave empty to use DEEPSEEK_MODEL
-WRITER_CONCURRENCY=4       # parallel section writers
-WRITER_MAX_RETRIES=3       # write→verify→rewrite loops per section
-WRITE_TIMEOUT=1800
-
-# PDF download
-PDF_MAX_ATTEMPTS=3
-PDF_RETRY_SLEEP=2.0
-PDF_TIMEOUT=60
-SEARCH_TIMEOUT=900
 ```
-
-## Output Fields (papers.db)
-
-| Field | Purpose |
-|---|---|
-| `paper_id` | Dedup key: `arxiv:<id>` or `<source>:<hash>` |
-| `title` | Paper title |
-| `authors` | Author list (JSON) |
-| `abstract` | Paper abstract |
-| `overview` | Summary by search worker |
-| `source` | `arxiv` / `openreview` / `acl` / ... |
-| `source_url` | Canonical URL |
-| `venue` | Publication venue |
-| `arxiv_id` | arXiv ID (null for non-arXiv) |
-| `bibtex` | BibTeX citation |
-| `artifact_rel_path` | Local PDF or MD path |
-| `relevance_score` | 1–5 relevance rating |
+src/
+├── papermind/       # 入口（PM 命令）
+├── shared/          # 共享模型、数据库、配置
+├── mcp_servers/     # DDG 搜索 + 网页抓取 + RAG 检索
+├── agents/          # Explorer / Researcher / Writer / Reviewer / Polisher
+├── orchestrator/    # LangGraph 主 Agent 编排
+└── rag/             # FAISS 索引和检索
+```

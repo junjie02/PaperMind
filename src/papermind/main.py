@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PM (PaperMind) — 一键完成文献搜集 + 大纲生成
+PM (PaperMind) — 主 Agent + Multi Sub-Agent 文献综述生成
 
 用法:
     PM "agent 安全研究" -n 15
-    PM "diffusion models for video" -n 30 -w 2 --skip-outline
-    PM "vision transformers" -n 10 --skip-pdf
+    PM "diffusion models for video" -n 30
+    PM "vision transformers" -n 10
 """
 
 import argparse
@@ -22,156 +22,142 @@ logging.basicConfig(
 )
 logger = logging.getLogger("papermind")
 
+# Suppress noisy third-party loggers
+logging.getLogger("ddgs.ddgs").setLevel(logging.WARNING)
+logging.getLogger("primp").setLevel(logging.WARNING)
+logging.getLogger("langchain_openai.chat_models._client_utils").setLevel(logging.WARNING)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="PM",
-        description="PaperMind — 一键完成文献搜集 + 大纲生成",
+        description="PaperMind — 主 Agent + Multi Sub-Agent 文献综述生成",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   PM "agent 安全研究" -n 15
-  PM "diffusion models for video" -n 30 -w 2
-  PM "vision transformers" -n 10 --skip-pdf
-  PM "LLM reasoning" -n 20 --skip-outline
+  PM "diffusion models for video" -n 30
+  PM "vision transformers" -n 10
         """,
     )
     parser.add_argument("question", help="研究课题")
-    parser.add_argument("-n", "--num-papers", type=int, default=30,
-                        help="目标论文数量 (默认: 30)")
-    parser.add_argument("-w", "--workers", type=int, default=1,
-                        help="并行 Claude Code Worker 数 (默认: 1)")
+    parser.add_argument("-n", "--num-papers", type=int, default=20,
+                        help="目标参考文献总数（默认 20）")
     parser.add_argument("--out", default=None,
                         help="运行输出目录；不传则自动生成 runs/{时间戳}-{slug}/")
-    parser.add_argument("--skip-pdf", action="store_true",
-                        help="跳过 PDF/MD 产物下载")
-    parser.add_argument("--skip-outline", action="store_true",
-                        help="只搜集文献，不生成大纲")
-    parser.add_argument("-s", "--sections", type=int, default=8,
-                        help="大纲目标章节数 (默认: 8)")
-    parser.add_argument("--subsections", type=int, default=2,
-                        help="每章节子节数 (默认: 2)")
+    parser.add_argument("--resume", default=None,
+                        help="从已有运行目录恢复，指定起始阶段（如 build_index、write_sections）")
+    parser.add_argument("--skip-review", action="store_true",
+                        help="跳过 reviewer 评审阶段，writer 写完直接进入 polish")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="开启 DEBUG 日志")
-    parser.add_argument("--skip-write", action="store_true",
-                        help="跳过综述正文写作（Phase 3）")
     return parser
 
 
-async def _run_deepresearch(question: str, num_papers: int, workers: int,
-                            run_dir: Path, skip_pdf: bool) -> bool:
-    """Phase 1: literature collection via Claude Code workers."""
-    from deepresearch.config import Config
-    from deepresearch.orchestrator import Orchestrator
-
-    config = Config()
-    config.db_path = str(run_dir / "papers.db")
-    config.pdf_dir = str(run_dir / "pdfs")
-
-    orchestrator = Orchestrator(config)
-    try:
-        papers = await orchestrator.run(
-            research_question=question,
-            target_count=num_papers,
-            workers_per_round=workers,
-            skip_pdf=skip_pdf,
-        )
-        logger.info("文献搜集完成: %d 篇", len(papers))
-        return len(papers) > 0
-    finally:
-        await orchestrator.close()
-
-
-def _run_outline(run_dir: Path, topic: str, sections: int, subsections: int) -> bool:
-    """Phase 2: outline generation via LangGraph pipeline."""
-    from deepresearch.config import Config
-
-    from outliner.graph import build_graph
-
-    config = Config()
-    if not config.llm_api_key:
-        logger.warning("未设置 DEEPSEEK_API_KEY，跳过大纲生成")
-        return False
-
-    class _Args:
-        out = None
-        recluster = True
-        force = True
-
-    initial_state = {
-        "in_dir": str(run_dir),
-        "topic": topic,
-        "n_sections": sections,
-        "n_subsections": subsections,
-        "messages": [],
-        "papers": [],
-        "cluster_assignments": [],
-        "cluster_skipped_reason": "",
-        "paper_groups": [],
-        "chapter_plan": [],
-        "survey_title": "",
-        "group_outlines": [],
-        "final_outline": "",
-        "references_md": "",
-        "output_path": "",
-        "revision_count": 0,
-        "review_feedback": "",
-    }
-
-    _Args.out = str(run_dir / "outline.md")
-    graph = build_graph(config, _Args)
-    config_lg = {"configurable": {"thread_id": f"pm-{run_dir.name}"}}
-
-    try:
-        final = graph.invoke(initial_state, config_lg)
-        logger.info("大纲已生成: %s", final.get("output_path", "?"))
-        return True
-    except Exception as e:
-        logger.error("大纲生成失败: %s", e)
-        return False
-
-
-def _run_write(run_dir: Path) -> bool:
-    """Phase 3: write full review via DeepSeek concurrent writers + RAG."""
-    from deepresearch.config import Config
-
-    from outliner.db import count_papers
-    from outliner.indexer import build_index_from_run
-    from outliner.review_orchestrator import ReviewOrchestrator
-
-    config = Config()
-    outline = (run_dir / "outline.md").read_text(encoding="utf-8")
-
-    try:
-        build_index_from_run(run_dir, embedding_model=config.embedding_model)
-    except ValueError as e:
-        logger.warning("跳过综述写作: %s", e)
-        return False
-
-    n_papers = count_papers(run_dir / "papers.db")
-    orchestrator = ReviewOrchestrator(config, run_dir)
-    review_md = asyncio.run(orchestrator.write_review(outline, n_papers))
-
-    if review_md:
-        (run_dir / "review.md").write_text(review_md, encoding="utf-8")
-        logger.info("综述已生成: %s", run_dir / "review.md")
-        return True
-    else:
-        logger.error("综述写作失败")
-        return False
+def _slugify(text: str) -> str:
+    import re
+    text = text.lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text[:40].strip("-")
 
 
 def _resolve_run_dir(out: str | None, question: str) -> Path:
-    from deepresearch.text_utils import slugify
-
     if out:
         run_dir = Path(out).expanduser().resolve()
     else:
         project_root = Path(__file__).resolve().parent.parent.parent
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-        run_dir = project_root / "runs" / f"{timestamp}-{slugify(question)}"
+        run_dir = project_root / "runs" / f"{timestamp}-{_slugify(question)}"
     (run_dir / "pdfs").mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def _load_resume_state(run_dir: Path) -> dict:
+    """Load existing state from a run directory for resuming."""
+    import json
+    state: dict = {}
+
+    # Restore outline from data/main_agent.json (parse from LLM output)
+    outline_md = run_dir / "outline.md"
+    if outline_md.exists():
+        # Parse outline.md back into structured format
+        chapters = []
+        current_chapter: dict | None = None
+        for line in outline_md.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                if current_chapter:
+                    chapters.append(current_chapter)
+                current_chapter = {"title": line[3:].strip(), "description": "", "sub_questions": []}
+            elif line.startswith("- ") and current_chapter is not None:
+                # Strip trailing （目标 N 篇）
+                import re
+                sq = re.sub(r"\s*（目标\s*\d+\s*篇）\s*$", "", line[2:].strip())
+                current_chapter["sub_questions"].append(sq)
+            elif line and current_chapter is not None and not current_chapter["description"]:
+                current_chapter["description"] = line.strip()
+        if current_chapter:
+            chapters.append(current_chapter)
+        if chapters:
+            state["research_outline"] = chapters
+            logger.info("恢复大纲: %d 章节", len(chapters))
+
+    # Restore main_agent conversation history
+    main_agent_log = run_dir / "data" / "main_agent.json"
+    if main_agent_log.exists():
+        try:
+            records = json.loads(main_agent_log.read_text(encoding="utf-8"))
+            if records:
+                last = records[-1]
+                history = last.get("history", [])
+                # Add the last exchange
+                if last.get("input") and last.get("output"):
+                    history = history + [
+                        {"role": "human", "content": last["input"]},
+                        {"role": "ai", "content": last["output"]},
+                    ]
+                state["agent_messages"] = history
+        except Exception as e:
+            logger.warning("恢复主 Agent 历史失败: %s", e)
+
+    return state
+
+
+async def _run_pipeline(question: str, run_dir: Path, num_papers: int = 20, resume_from: str | None = None, skip_review: bool = False) -> None:
+    from orchestrator.graph import build_graph
+    from shared.config import Config
+
+    config = Config()
+    if not config.llm_api_key:
+        logger.error("未设置 OPENAI_API_KEY，无法运行")
+        sys.exit(1)
+
+    graph = build_graph(config)
+    initial_state = {
+        "research_topic": question,
+        "run_dir": str(run_dir),
+        "db_path": str(run_dir / "papers.db"),
+        "target_papers": num_papers,
+        "skip_review": skip_review,
+        "revision_count": 0,
+        "max_revisions": 2,
+    }
+
+    if resume_from:
+        from orchestrator.graph import build_graph_from
+        graph = build_graph_from(config, resume_from)
+        # Restore state from run directory
+        initial_state.update(_load_resume_state(run_dir))
+        logger.info("从阶段 [%s] 恢复运行", resume_from)
+
+    config_lg = {"configurable": {"thread_id": f"pm-{run_dir.name}"}}
+    final = await graph.ainvoke(initial_state, config_lg)
+
+    output_path = final.get("output_path", "")
+    if output_path:
+        logger.info("综述已生成: %s", output_path)
+    else:
+        logger.warning("综述生成可能未完成，请检查运行目录: %s", run_dir)
 
 
 def main():
@@ -184,54 +170,20 @@ def main():
     run_dir = _resolve_run_dir(args.out, args.question)
     logger.info("PaperMind 启动")
     logger.info("研究课题: %s", args.question)
+    logger.info("目标文献: %d 篇", args.num_papers)
     logger.info("运行目录: %s", run_dir)
 
-    # Phase 1: 文献搜集
-    logger.info("=" * 50)
-    logger.info("Phase 1: 文献搜集 (Claude Code)")
-    logger.info("=" * 50)
-    has_papers = asyncio.run(
-        _run_deepresearch(args.question, args.num_papers, args.workers,
-                          run_dir, args.skip_pdf)
-    )
+    asyncio.run(_run_pipeline(args.question, run_dir, num_papers=args.num_papers, resume_from=args.resume, skip_review=args.skip_review))
 
-    if not has_papers:
-        logger.error("未搜集到任何论文，流程终止")
-        sys.exit(1)
-
-    # Phase 2: 大纲生成
-    if args.skip_outline:
-        logger.info("跳过大纲生成 (--skip-outline)")
-    else:
-        logger.info("=" * 50)
-        logger.info("Phase 2: 大纲生成 (LangGraph + DeepSeek)")
-        logger.info("=" * 50)
-        _run_outline(run_dir, args.question, args.sections, args.subsections)
-
-    # Phase 3: 综述写作
-    outline_path = run_dir / "outline.md"
-    if args.skip_outline or args.skip_write:
-        logger.info("跳过综述写作 (--skip-write)")
-    elif not outline_path.exists():
-        logger.warning("outline.md 不存在，跳过综述写作")
-    else:
-        logger.info("=" * 50)
-        logger.info("Phase 3: 综述写作 (DeepSeek + FAISS RAG)")
-        logger.info("=" * 50)
-        _run_write(run_dir)
-
-    # 最终汇总
     print(f"\n{'=' * 60}")
-    print(f"PaperMind 完成")
+    print("PaperMind 完成")
     print(f"运行目录: {run_dir}")
-    print(f"数据库:   {run_dir / 'papers.db'}")
-    print(f"产物目录: {run_dir / 'pdfs'}")
-    outline_path = run_dir / "outline.md"
-    if outline_path.exists():
-        print(f"大纲:     {outline_path}")
-    review_path = run_dir / "review.md"
-    if review_path.exists():
-        print(f"综述:     {review_path}")
+    db_path = run_dir / "papers.db"
+    if db_path.exists():
+        print(f"数据库:   {db_path}")
+    survey_path = run_dir / "survey.md"
+    if survey_path.exists():
+        print(f"综述:     {survey_path}")
     print(f"{'=' * 60}")
 
 

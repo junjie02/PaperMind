@@ -60,7 +60,6 @@ def extract_all(run_dir: Path) -> dict[str, str]:
 
 
 def _extract_pdf_text(pdf_path: Path) -> str:
-    """Extract all text from a PDF using PyMuPDF."""
     doc = pymupdf.open(str(pdf_path))
     pages = []
     for page in doc:
@@ -72,7 +71,6 @@ def _extract_pdf_text(pdf_path: Path) -> str:
 
 
 def _load_paper_artifacts(db_path: Path) -> list[tuple[str, str | None, str]]:
-    """Load paper_id, artifact_rel_path, title from SQLite."""
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(

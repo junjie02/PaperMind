@@ -4,7 +4,7 @@ from datetime import datetime
 
 import aiosqlite
 
-from deepresearch.models import PaperRecord
+from shared.models import PaperRecord
 
 logger = logging.getLogger(__name__)
 

@@ -1,18 +1,15 @@
-"""FAISS-based embedding and indexing for paper chunks.
-
-Saves faiss.index and chunks.pkl to the run directory.
-No external services required.
-"""
+"""FAISS-based embedding and indexing for paper chunks."""
 
 import logging
 import pickle
+import sqlite3
 from pathlib import Path
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from .chunker import Chunk
+from rag.chunker import Chunk
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +18,6 @@ def build_index(
     run_dir: Path,
     chunks: list[Chunk],
     embedding_model: str = "all-MiniLM-L6-v2",
-    **_kwargs,  # absorb legacy qdrant_url kwarg if passed
 ) -> str:
     """Embed chunks and save FAISS index to run_dir. Returns index file path."""
     index_path = run_dir / "faiss.index"
@@ -37,7 +33,7 @@ def build_index(
     faiss.normalize_L2(embeddings)
 
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # cosine similarity via normalized inner product
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
     faiss.write_index(index, str(index_path))
@@ -48,13 +44,42 @@ def build_index(
     return str(index_path)
 
 
+def _fallback_abstracts(run_dir: Path) -> dict[str, str]:
+    """Use abstract + overview from papers.db as fallback text for indexing."""
+    db_path = run_dir / "papers.db"
+    if not db_path.exists():
+        return {}
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT paper_id, title, abstract, overview FROM papers"
+        ).fetchall()
+    finally:
+        conn.close()
+    results: dict[str, str] = {}
+    for paper_id, title, abstract, overview in rows:
+        parts = [f"# {title}"]
+        if abstract:
+            parts.append(f"\n## Abstract\n{abstract}")
+        if overview:
+            parts.append(f"\n## Overview\n{overview}")
+        text = "\n".join(parts)
+        if len(text) > 50:
+            results[paper_id] = text
+    logger.info("Fallback abstracts: %d papers with text", len(results))
+    return results
+
+
 def build_index_from_run(run_dir: Path, embedding_model: str = "all-MiniLM-L6-v2") -> str:
     """Extract PDFs, chunk, embed, and save FAISS index for a run directory."""
-    from .chunker import chunk_all
-    from .db import load_paper_titles
-    from .pdf_converter import extract_all
+    from rag.chunker import chunk_all
+    from rag.db import load_paper_titles
+    from rag.pdf_extractor import extract_all
 
     papers_text = extract_all(run_dir)
+    if not papers_text:
+        logger.warning("No paper text extracted from PDFs in %s, falling back to abstracts", run_dir)
+        papers_text = _fallback_abstracts(run_dir)
     if not papers_text:
         raise ValueError(f"No paper text found in {run_dir}")
 

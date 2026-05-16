@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-PaperMind is an automated literature survey tool. It uses Claude Code as a search worker to collect papers, then generates a structured literature review outline via a LangGraph pipeline backed by a DeepSeek/OpenAI-compatible LLM.
+PaperMind is an automated literature survey tool. A main Agent (LangGraph + MiniMax LLM) orchestrates multiple concurrent Sub-Agents to handle direction exploration, paper mining, writing, review, and polishing. Search and RAG capabilities are exposed as local MCP tools.
 
 ## Commands
 
@@ -12,42 +12,61 @@ PaperMind is an automated literature survey tool. It uses Claude Code as a searc
 # Install (editable, into a venv)
 pip install -e .
 
-# Run the full pipeline (search + outline)
-PM "research topic" -n 15
+# Run the full pipeline
+PM "research topic" -n 30
+PM "agent safety" -n 15 -v
 
-# Run only paper collection
-deepresearch "research topic" -n 15 -w 2
-
-# Run only outline generation from an existing run
-outline --in runs/<run-dir>
+# Resume from a specific phase (reuse existing run directory)
+PM "research topic" --out runs/existing-run --resume build_index
+PM "research topic" --out runs/existing-run --resume write_sections
 ```
 
 There are no tests, linters, or build steps configured beyond `pip install -e .`.
 
 ## Architecture
 
-Three packages under `src/`, each with its own CLI entry point:
+Six packages under `src/`:
 
-- **`papermind`** (`PM` command) — orchestrates the two phases sequentially. Calls deepresearch then outliner.
-- **`deepresearch`** (`deepresearch` command) — paper collection phase. Spawns Claude Code as a subprocess (`claude --print --output-format stream-json --json-schema ...`) to do web searches and extract structured paper metadata. Results are deduplicated and stored in SQLite (`papers.db`). Optionally downloads PDFs (arXiv) or generates markdown summaries (other sources).
-- **`outliner`** (`outline` command) — outline generation phase. A LangGraph `StateGraph` with nodes: `load_papers → cluster_papers → group_by_direction → draft_per_group → merge_outlines → review_outline (loop) → render_references`. Uses LangChain's `ChatOpenAI` pointed at a DeepSeek endpoint.
+- **`papermind`** (`PM` command) — entry point, starts the LangGraph pipeline. Supports `--resume <phase>` to restart from any node.
+- **`shared`** — `Config` dataclass, `PaperRecord`/`AgentTask`/`AgentResult` Pydantic models, SQLite `Database`, `DedupEngine`.
+- **`mcp_servers`** — local MCP tool servers: `ddg_search.py` (DuckDuckGo via `ddgs` package, also provides `fetch_pages_batch` for web scraping) and `rag_retrieval.py` (FAISS retriever).
+- **`agents`** — Sub-Agent implementations, all single-prompt with conversation memory:
+  - `ExplorerAgent` — background research on sub-directions (DDG search + page fetch, 3 iterations)
+  - `ResearcherAgent` — targeted paper collection with PDF download (DDG search + selective fetch, up to 12 iterations, stops when target count reached)
+  - `WriterAgent` — RAG-based section writing with fact verification loop
+  - `ReviewerAgent` — draft quality review
+  - `PolisherAgent` / `ConsistencyCheckerAgent` — final polish and cross-section consistency
+- **`orchestrator`** — LangGraph `StateGraph` with phases: explore → outline → research → coverage check → build_index → write → review → polish → merge.
+  - `MainAgent` — single system prompt, persistent conversation memory across all orchestration phases
+  - `nodes.py` — Phase 1-3 nodes
+  - `nodes_writing.py` — Phase 4-6 nodes (includes PDF backfill before indexing)
+- **`rag`** — FAISS indexing (`indexer.py`), chunking (`chunker.py`), retrieval (`retriever.py`), paper DB helpers (`db.py`), PDF text extraction (`pdf_extractor.py`). Falls back to abstract/overview if no PDF available.
 
 ### Key design decisions
 
-- `SearchClient` invokes `claude` CLI as a subprocess, not the Anthropic SDK. It streams JSON events and parses the final `type=result` event for structured output.
-- The outliner graph uses `Command(goto=...)` for all transitions (no static edges). The `review_outline` node can loop back to itself up to `OUTLINE_MAX_REVISIONS` times.
-- Config is a single `@dataclass` (`deepresearch/config.py`) populated from `.env` via `python-dotenv`. Both packages share it.
+- Main Agent only orchestrates — no direct search or writing. All execution is delegated to Sub-Agents.
+- Sub-Agents call MCP tool functions via direct Python import (not stdio protocol) to avoid process overhead.
+- All Sub-Agents share the same MiniMax LLM config (`OPENAI_*` env vars).
+- Main Agent decides Sub-Agent concurrency per phase (hard cap: 3). `asyncio.Semaphore` enforces this.
+- Main Agent allocates per-question paper targets based on importance; user specifies total via `-n`.
+- `asyncio.wait_for` in `SubAgentBase.run()` enforces per-agent timeouts.
+- Explorer and Researcher agents use single-prompt + conversation memory pattern (not multi-chain).
+- Researcher downloads PDFs inline; `build_index` node backfills any missing artifacts before FAISS indexing.
 - Paper deduplication uses `arxiv:<id>` for arXiv papers and `<source>:<url-hash>` for others.
+- LangGraph graph uses `Command(goto=...)` for all transitions (no static edges).
+- Introduction and Conclusion are written after all body sections complete (not sent to researcher).
 
 ## Environment
 
 - Python >= 3.12
-- Requires `claude` CLI installed and authenticated (used as the search backend)
-- `.env` file at project root (copy from `.env.example`). Key vars: `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `WORKER_MODEL`, `HTTP_PROXY`.
+- `.env` file at project root (copy from `.env.example`). Key vars: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `HTTP_PROXY`.
 
 ## Output
 
 Each run creates `runs/{timestamp}-{slug}/` containing:
 - `papers.db` — SQLite with all paper metadata
-- `pdfs/` — downloaded PDFs and markdown artifacts
-- `outline.md` — final literature review outline
+- `pdfs/` — downloaded PDF files + generated MD for papers without PDFs
+- `faiss.index` + `chunks.pkl` — FAISS vector index
+- `outline.md` — research outline with per-question paper targets
+- `data/` — full agent I/O logs (JSON)
+- `survey.md` — final literature review
