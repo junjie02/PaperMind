@@ -220,6 +220,93 @@ def _resolve_citations(full_text: str, db_path: str) -> tuple[str, list[str]]:
     return processed, ref_lines
 
 
+def _is_inside_citation(text: str, pos: int) -> bool:
+    """Check if position is inside a [...] citation bracket."""
+    bracket_start = text.rfind("[", 0, pos)
+    if bracket_start == -1:
+        return False
+    bracket_end = text.find("]", bracket_start)
+    return bracket_end > pos
+
+
+def _is_abbreviation(term: str) -> bool:
+    """Check if term is an abbreviation (all caps, 2-6 chars)."""
+    return term.isupper() and 2 <= len(term) <= 6
+
+
+def _apply_terminology_fixes(sections: dict[str, str], issues: list[dict]) -> dict[str, str]:
+    """Context-aware terminology replacement.
+
+    Rules:
+    - Skip replacements inside citation brackets [...]
+    - Skip if recommended looks like a sentence
+    - First occurrence in full text: use full form + abbreviation if applicable
+    - Subsequent occurrences: use recommended form
+    - Replace from back to front to preserve positions
+    """
+    for issue in issues:
+        recommended = issue.get("recommended", "")
+        variants = issue.get("variants", [])
+        if not recommended or len(recommended) > 20 or "，" in recommended or "。" in recommended:
+            continue
+        if not variants:
+            continue
+
+        # Step 1: Scan all occurrences across all sections
+        occurrences: list[dict] = []
+        for key, text in sections.items():
+            for variant in variants:
+                if variant == recommended or len(variant) < 2:
+                    continue
+                for match in re.finditer(re.escape(variant), text):
+                    occurrences.append({
+                        "section": key,
+                        "pos": match.start(),
+                        "variant": variant,
+                        "in_citation": _is_inside_citation(text, match.start()),
+                    })
+
+        if not occurrences:
+            continue
+
+        # Step 2: Decide action for each occurrence
+        first_replacement = True
+        for occ in occurrences:
+            if occ["in_citation"]:
+                occ["action"] = "keep"
+            elif first_replacement and _is_abbreviation(recommended):
+                # First time: expand to "全称（缩写）"
+                full_form = next((v for v in variants if not v.isupper() and len(v) > len(recommended)), "")
+                if full_form:
+                    occ["action"] = "replace"
+                    occ["new_text"] = f"{full_form}（{recommended}）"
+                else:
+                    occ["action"] = "replace"
+                    occ["new_text"] = recommended
+                first_replacement = False
+            else:
+                occ["action"] = "replace"
+                occ["new_text"] = recommended
+
+        # Step 3: Apply replacements back-to-front per section
+        for key in sections:
+            section_occs = sorted(
+                [o for o in occurrences if o["section"] == key],
+                key=lambda x: -x["pos"],
+            )
+            text = sections[key]
+            for occ in section_occs:
+                if occ["action"] == "keep":
+                    continue
+                pos = occ["pos"]
+                variant = occ["variant"]
+                new_text = occ.get("new_text", recommended)
+                text = text[:pos] + new_text + text[pos + len(variant):]
+            sections[key] = text
+
+    return sections
+
+
 _TRANSITION_SYSTEM = "你是学术写作专家，负责生成章节间的过渡句。"
 _TRANSITION_USER = """\
 上一章节结尾：
@@ -568,20 +655,10 @@ def build_writing_nodes(config: Config):
             else:
                 ordered_keys.append(chapter["title"])
 
-        # Apply terminology replacements
+        # Apply terminology replacements (context-aware)
         terminology_issues = consistency_report.get("terminology_issues", [])
         sections = dict(polished_sections)
-        for issue in terminology_issues:
-            recommended = issue.get("recommended", "")
-            variants = issue.get("variants", [])
-            # Skip if recommended looks like a sentence rather than a term
-            if not recommended or len(recommended) > 20 or "，" in recommended or "。" in recommended:
-                continue
-            if recommended and variants:
-                for key in sections:
-                    for variant in variants:
-                        if variant != recommended:
-                            sections[key] = sections[key].replace(variant, recommended)
+        sections = _apply_terminology_fixes(sections, terminology_issues)
 
         # Insert transition sentences for flagged transitions
         transition_issues = consistency_report.get("transition_issues", [])
