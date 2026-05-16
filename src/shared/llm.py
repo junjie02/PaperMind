@@ -25,3 +25,17 @@ def make_llm(
         max_retries=3,
         extra_body={"reasoning_split": True},
     )
+
+
+def make_review_llm(config: Config, temperature: float = 0.3) -> ChatOpenAI:
+    """Return a ChatOpenAI instance for the final review model (separate API config)."""
+    api_key = config.review_api_key or config.llm_api_key
+    base_url = config.review_base_url or config.llm_base_url
+    model = config.review_model or config.llm_model
+    return ChatOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        max_retries=3,
+    )

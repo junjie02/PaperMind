@@ -197,27 +197,70 @@ def _resolve_citations(full_text: str, db_path: str) -> tuple[str, list[str]]:
 
     processed = citation_pattern.sub(_replace, full_text)
 
-    # Generate references list (unified plain text format)
+    # Generate references list in GB/T 7714 format
     ref_lines: list[str] = []
     for num in sorted(citation_info.keys()):
         title, authors_json, venue, year, bibtex = citation_info[num]
-        try:
-            authors_list = json.loads(authors_json) if authors_json else []
-        except (json.JSONDecodeError, TypeError):
-            authors_list = []
-        authors_str = ", ".join(authors_list[:3])
-        if len(authors_list) > 3:
-            authors_str += " et al."
-        if not authors_str:
-            authors_str = "Unknown"
-        venue_str = f", {venue}" if venue else ""
-        year_str = f", {year}" if year else ""
-        ref_lines.append(f"[{num}] {authors_str}, \"{title}\"{venue_str}{year_str}.")
+        ref_lines.append(f"[{num}] {_format_gbt7714(title, authors_json, venue, year, bibtex)}")
 
     if unmatched:
         logger.warning("[merge_final] %d citations could not be matched to database", len(unmatched))
 
     return processed, ref_lines
+
+
+def _format_gbt7714(title: str, authors_json: str, venue: str, year: str, bibtex: str) -> str:
+    """Format a reference in GB/T 7714 style.
+
+    Format: Author1 Initials, Author2 Initials, Author3 Initials, et al. Title[Type]//Venue, Year.
+    """
+    # Parse authors
+    try:
+        authors_list = json.loads(authors_json) if authors_json else []
+    except (json.JSONDecodeError, TypeError):
+        authors_list = []
+
+    # Format author names: "Guangxuan Xiao" → "Xiao G"
+    formatted_authors = []
+    for author in authors_list[:3]:
+        parts = author.strip().split()
+        if len(parts) >= 2:
+            last = parts[-1]
+            initials = "".join(p[0].upper() for p in parts[:-1])
+            formatted_authors.append(f"{last} {initials}")
+        elif parts:
+            formatted_authors.append(parts[0])
+    if len(authors_list) > 3:
+        formatted_authors.append("et al")
+    authors_str = ", ".join(formatted_authors) if formatted_authors else "Unknown"
+
+    # Determine document type
+    venue_lower = (venue or "").lower()
+    if "arxiv" in venue_lower or not venue:
+        doc_type = "EB/OL"
+    elif any(kw in venue_lower for kw in ["conference", "proceedings", "workshop", "icml", "neurips",
+             "iclr", "acl", "emnlp", "cvpr", "iccv", "aaai", "ijcai", "osdi", "sosp", "mlsys"]):
+        doc_type = "C"
+    else:
+        doc_type = "J"
+
+    # Build reference string
+    if doc_type == "C":
+        return f"{authors_str}. {title}[C]//{venue}, {year}."
+    elif doc_type == "J":
+        return f"{authors_str}. {title}[J]. {venue}, {year}."
+    else:
+        # arXiv / online
+        # Try to extract arxiv_id from bibtex
+        arxiv_id = ""
+        if bibtex:
+            import re as _re
+            m = _re.search(r"eprint\s*=\s*\{?(\d+\.\d+)", bibtex)
+            if m:
+                arxiv_id = m.group(1)
+        if arxiv_id:
+            return f"{authors_str}. {title}[EB/OL]. arXiv:{arxiv_id}, {year}."
+        return f"{authors_str}. {title}[EB/OL]. {venue or 'Online'}, {year}."
 
 
 def _is_inside_citation(text: str, pos: int) -> bool:
@@ -511,6 +554,15 @@ def build_writing_nodes(config: Config):
         if not tasks_to_run:
             return Command(update={}, goto="polish_sections")
 
+        # Load available papers from DB for writer reference
+        available_papers: list[dict] = []
+        db_path_str = state.get("db_path", "")
+        if db_path_str and Path(db_path_str).exists():
+            conn = sqlite3.connect(db_path_str)
+            rows = conn.execute("SELECT title, overview FROM papers WHERE overview != ''").fetchall()
+            conn.close()
+            available_papers = [{"title": t, "overview": o} for t, o in rows]
+
         semaphore = asyncio.Semaphore(min(3, state.get("agent_concurrency", max_concurrent)))
 
         # Build adjacent context map
@@ -536,6 +588,7 @@ def build_writing_nodes(config: Config):
                 "section_title": section_info["section_title"],
                 "outline_text": section_info["outline_text"],
                 "adjacent_context": adjacent,
+                "available_papers": available_papers,
             }, ensure_ascii=False)
             task = AgentTask(instruction=instruction, max_iterations=12, run_dir=run_dir)
 
@@ -634,111 +687,107 @@ def build_writing_nodes(config: Config):
         result = await agent.run(task)
         report = result.metadata[0] if result.metadata else {}
 
-        return Command(update={"consistency_report": report}, goto="merge_final")
+        return Command(update={"consistency_report": report}, goto="final_review")
 
-    # ── Node: merge_final ───────────────────────────────────────────────────
+    # ── Node: final_review ─────────────────────────────────────────────────
 
-    async def merge_final(state: PaperMindState) -> Command:
+    async def final_review(state: PaperMindState) -> Command:
+        """Global final review: send full text + paper titles to review LLM."""
+        from shared.llm import make_review_llm
+        from langchain_core.messages import HumanMessage, SystemMessage
+
         polished_sections = state.get("polished_sections", {})
         outline = state.get("research_outline", [])
-        consistency_report = state.get("consistency_report", {})
         topic = state["research_topic"]
         run_dir = Path(state["run_dir"])
-        logger.info("[orchestrator] merge_final")
+        db_path = run_dir / "papers.db"
+        logger.info("[orchestrator] final_review")
 
-        # Build ordered section list
-        ordered_keys: list[str] = []
-        for chapter in outline:
-            sqs = chapter.get("sub_questions", [])
-            if sqs:
-                ordered_keys.extend(sqs)
-            else:
-                ordered_keys.append(chapter["title"])
-
-        # Apply terminology replacements (context-aware)
-        terminology_issues = consistency_report.get("terminology_issues", [])
-        sections = dict(polished_sections)
-        sections = _apply_terminology_fixes(sections, terminology_issues)
-
-        # Insert transition sentences for flagged transitions
-        transition_issues = consistency_report.get("transition_issues", [])
-        if transition_issues:
-            for i in range(len(ordered_keys) - 1):
-                prev_key = ordered_keys[i]
-                next_key = ordered_keys[i + 1]
-                if prev_key in sections and next_key in sections:
-                    prev_tail = sections[prev_key][-200:]
-                    next_head = sections[next_key][:200]
-                    # Only add transition if flagged
-                    flagged = any(
-                        prev_key in issue or next_key in issue
-                        for issue in transition_issues
-                    )
-                    if flagged:
-                        try:
-                            transition = await transition_chain.ainvoke({
-                                "prev_tail": prev_tail,
-                                "next_head": next_head,
-                            })
-                            sections[next_key] = transition.strip() + "\n\n" + sections[next_key]
-                        except Exception as e:
-                            logger.warning("[orchestrator] transition generation failed: %s", e)
-
-        # Assemble final document with chapter grouping and auto-numbering
+        # Assemble full text with chapter numbering (no references yet)
         parts = [f"# {topic}\n"]
         chapter_num = 0
-        body_summaries: list[str] = []
-
         for chapter in outline:
             chapter_title = chapter["title"]
             title_lower = chapter_title.lower()
             sqs = chapter.get("sub_questions", [])
-
-            # Skip intro/conclusion — will be generated separately
             if not sqs and (title_lower.startswith("intro") or title_lower.startswith("conclusion")):
                 continue
-
             chapter_num += 1
             if sqs:
                 parts.append(f"\n## {chapter_num} {chapter_title}\n")
-                sub_num = 0
                 for sq in sqs:
-                    if sq in sections:
-                        sub_num += 1
-                        cleaned = _strip_draft_headings(sections[sq])
-                        # Renumber ### headings within this section
-                        cleaned = _renumber_h3(cleaned, chapter_num, sub_num)
+                    if sq in polished_sections:
+                        cleaned = _strip_draft_headings(polished_sections[sq])
                         parts.append(f"\n{cleaned}")
-                        body_summaries.append(f"[{chapter_title}/{sq}] {cleaned[:300]}")
             else:
-                if chapter_title in sections:
-                    cleaned = _strip_draft_headings(sections[chapter_title])
-                    cleaned = _renumber_h3(cleaned, chapter_num, 0)
+                if chapter_title in polished_sections:
+                    cleaned = _strip_draft_headings(polished_sections[chapter_title])
                     parts.append(f"\n## {chapter_num} {chapter_title}\n\n{cleaned}")
-                    body_summaries.append(f"[{chapter_title}] {cleaned[:300]}")
 
-        body_text = "\n".join(parts)
+        full_text = "\n".join(parts)
 
-        # Generate Introduction and Conclusion via LLM
-        intro_text = await _generate_intro_conclusion(
-            topic, body_summaries, "introduction", make_llm(config, temperature=0.3)
-        )
-        conclusion_text = await _generate_intro_conclusion(
-            topic, body_summaries, "conclusion", make_llm(config, temperature=0.3)
-        )
+        # Get all paper titles from DB
+        titles_list = ""
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path))
+            rows = conn.execute("SELECT title FROM papers").fetchall()
+            conn.close()
+            titles_list = "\n".join(f"- {r[0]}" for r in rows)
 
-        # Assemble full document
-        full_parts = [f"# {topic}\n"]
-        if intro_text:
-            full_parts.append(f"\n## 引言\n\n{intro_text}")
-        full_parts.append(body_text.replace(f"# {topic}\n", "", 1))
-        if conclusion_text:
-            full_parts.append(f"\n## {chapter_num + 1} 结论与展望\n\n{conclusion_text}")
+        # Call review LLM
+        review_llm = make_review_llm(config)
+        prompt = f"""\
+你是学术文献综述终审专家。以下是一篇已完成的文献综述和参考文献数据库中的所有论文标题。
 
-        full_text = "\n".join(full_parts)
+请对全文进行最终审校和修正：
+1. 修正言辞不合理、表述生硬或逻辑不通之处
+2. 如果正文中引用的论文标题（方括号内）与下方论文标题列表中的标题有偏差，修正为正确标题
+3. 检查章节结构是否完整、段落衔接是否自然
+4. 统一术语用法（但不要修改专有技术名称如 FlashAttention、PagedAttention 等）
+5. 删除重复内容或冗余段落
+6. 保持所有 [论文标题] 格式的引用标注，不要改变引用格式
+7. 给文章起个漂亮的名字，替换掉最顶上的一级标题
+
+## 数据库中的论文标题（供核对引用）
+{titles_list}
+
+## 待审校综述全文
+{full_text}
+
+请直接输出修正后的完整综述，保持 markdown 格式，不要输出任何前言或说明。"""
+
+        try:
+            messages = [
+                SystemMessage(content="你是学术文献综述终审专家，负责对全文进行最终审校和修正。"),
+                HumanMessage(content=prompt),
+            ]
+            response = await review_llm.ainvoke(messages)
+            reviewed_text = response.content.strip()
+            if reviewed_text and len(reviewed_text) > len(full_text) * 0.5:
+                full_text = reviewed_text
+                logger.info("[orchestrator] final_review completed (%d chars)", len(full_text))
+            else:
+                logger.warning("[orchestrator] final_review output too short, using original")
+        except Exception as e:
+            logger.error("[orchestrator] final_review failed: %s", e)
+
+        return Command(update={"reviewed_text": full_text}, goto="merge_final")
+
+    # ── Node: merge_final ───────────────────────────────────────────────────
+
+    async def merge_final(state: PaperMindState) -> Command:
+        run_dir = Path(state["run_dir"])
+        logger.info("[orchestrator] merge_final")
+
+        # Use reviewed text from final_review node
+        full_text = state.get("reviewed_text", "")
+
+        if not full_text:
+            logger.warning("[orchestrator] no reviewed_text, assembling from polished_sections")
+            full_text = f"# {state['research_topic']}\n\n(empty)"
 
         # Resolve citations: [paper title] → [N], with DB matching
-        db_path = Path(state["run_dir"]) / "papers.db"
+        db_path = run_dir / "papers.db"
         full_text, ref_lines = _resolve_citations(full_text, str(db_path))
         if ref_lines:
             full_text += "\n\n## 参考文献\n\n" + "\n".join(ref_lines)
@@ -758,5 +807,6 @@ def build_writing_nodes(config: Config):
         "write_sections": write_sections,
         "polish_sections": polish_sections,
         "check_consistency": check_consistency,
+        "final_review": final_review,
         "merge_final": merge_final,
     }

@@ -70,13 +70,81 @@ class Retriever:
         self._model = _get_model(embedding_model)
         self._keyword_chain = (_KEYWORD_PROMPT | llm | StrOutputParser()) if llm else None
 
-    def search(self, query: str, top_k: int = 6) -> list[Chunk]:
+    def search(self, query: str, top_k: int = 2) -> list[Chunk]:
+        """Search for top_k chunks, then expand with adjacent and random exploration."""
         vec = self._model.encode([query], show_progress_bar=False)
         vec = np.array(vec, dtype="float32")
         faiss.normalize_L2(vec)
         scores, indices = self._index.search(vec, min(top_k, len(self._chunks)))
-        results = [(float(s), self._chunks[i]) for s, i in zip(scores[0], indices[0]) if i >= 0]
-        return [c for _, c in sorted(results, key=lambda x: x[0], reverse=True)]
+        matched = [(float(s), self._chunks[i]) for s, i in zip(scores[0], indices[0]) if i >= 0]
+        top_chunks = [c for _, c in sorted(matched, key=lambda x: x[0], reverse=True)][:top_k]
+
+        # Expand with adjacent chunks and random exploration
+        expanded = self._expand_with_context(top_chunks)
+        return expanded
+
+    def _expand_with_context(self, matched_chunks: list[Chunk]) -> list[Chunk]:
+        """Add adjacent chunks (±1) and random exploration chunks for each matched result."""
+        import random
+
+        # Build paper_id → list of chunks index mapping
+        paper_chunks: dict[str, list[int]] = {}
+        for i, chunk in enumerate(self._chunks):
+            paper_chunks.setdefault(chunk.paper_id, []).append(i)
+
+        result_chunks: list[Chunk] = []
+        seen_indices: set[int] = set()
+        matched_global_indices: dict[str, set[int]] = {}  # paper_id → set of chunk_index
+
+        for chunk in matched_chunks:
+            # Find global index of this chunk
+            global_idx = None
+            for i, c in enumerate(self._chunks):
+                if c.paper_id == chunk.paper_id and c.chunk_index == chunk.chunk_index:
+                    global_idx = i
+                    break
+            if global_idx is None:
+                result_chunks.append(chunk)
+                continue
+
+            seen_indices.add(global_idx)
+            matched_global_indices.setdefault(chunk.paper_id, set()).add(chunk.chunk_index)
+
+            # Get adjacent chunks (chunk_index ± 1 within same paper)
+            prev_chunk = self._find_chunk(chunk.paper_id, chunk.chunk_index - 1)
+            next_chunk = self._find_chunk(chunk.paper_id, chunk.chunk_index + 1)
+
+            if prev_chunk:
+                result_chunks.append(prev_chunk)
+            result_chunks.append(chunk)
+            if next_chunk:
+                result_chunks.append(next_chunk)
+
+        # Random exploration: for each paper, pick 1 chunk with distance > 2 from any matched
+        for paper_id, matched_indices in matched_global_indices.items():
+            all_paper_chunk_indices = [
+                c.chunk_index for c in self._chunks if c.paper_id == paper_id
+            ]
+            # Exclude indices within distance ≤ 2 of any matched chunk
+            excluded = set()
+            for mi in matched_indices:
+                for d in range(-2, 3):
+                    excluded.add(mi + d)
+            candidates = [ci for ci in all_paper_chunk_indices if ci not in excluded]
+            if candidates:
+                chosen_idx = random.choice(candidates)
+                exploration_chunk = self._find_chunk(paper_id, chosen_idx)
+                if exploration_chunk:
+                    result_chunks.append(exploration_chunk)
+
+        return result_chunks
+
+    def _find_chunk(self, paper_id: str, chunk_index: int) -> Chunk | None:
+        """Find a specific chunk by paper_id and chunk_index."""
+        for c in self._chunks:
+            if c.paper_id == paper_id and c.chunk_index == chunk_index:
+                return c
+        return None
 
     def _search_vectors(self, vecs: np.ndarray, top_k: int) -> list[list[Chunk]]:
         faiss.normalize_L2(vecs)
@@ -144,6 +212,13 @@ def _merge_chunks(path_a: list[Chunk], path_b: list[Chunk], max_total: int) -> l
 
 
 def format_chunks_for_llm(chunks: list[Chunk]) -> str:
-    return "\n\n---\n\n".join(
-        f"[{c.paper_title} | {c.section_title}]\n{c.text}" for c in chunks
-    )
+    """Format chunks with source labels for LLM consumption."""
+    parts = []
+    seen = set()
+    for c in chunks:
+        key = f"{c.paper_id}:{c.chunk_index}"
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(f"[{c.paper_title} | {c.section_title}]\n{c.text}")
+    return "\n\n---\n\n".join(parts)

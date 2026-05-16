@@ -38,6 +38,12 @@ CONSISTENCY_SYSTEM = """\
 ## 任务
 检查综述各章节之间的一致性问题。
 
+## 重要限制
+- 不要把专有技术名称（如 FlashAttention、PagedAttention、SmoothQuant 等）替换为中文泛称
+- 不要把论文标题或论文标题的一部分列为需要替换的变体
+- 只处理同一概念的不同中文表述（如"大语言模型"vs"大型语言模型"），或同一缩写的不同写法
+- variants 中不要包含引用标题 [...] 内出现的文本
+
 ## 输出格式
 直接输出 JSON，不要任何前言或说明：
 {
@@ -51,6 +57,11 @@ CONSISTENCY_SYSTEM = """\
     "引用编号或格式异常描述"
   ]
 }
+
+## 示例
+正确：{"term": "大语言模型", "variants": ["大型语言模型", "超大语言模型"], "recommended": "大语言模型"}
+错误：{"term": "注意力优化", "variants": ["FlashAttention", "FlashAttention-2"], "recommended": "注意力优化"}
+错误原因：FlashAttention 是专有技术名称，不应被替换为中文泛称
 
 如果没有问题，对应字段输出空数组。
 """

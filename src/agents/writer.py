@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _PARSER = SimpleJsonOutputParser()
 
 WRITER_SYSTEM = """\
-你是 PaperMind 文献综述写作专家，负责基于 RAG 检索到的论文片段撰写学术综述章节。
+你是 PaperMind 文献综述写作专家，负责严格基于 RAG 检索到的真实论文片段撰写学术综述章节。
 
 ## 你拥有的工具
 - **RAG 检索**：每轮可提交一个查询，系统从论文向量库中检索最相关的片段返回给你
@@ -51,10 +51,15 @@ WRITER_SYSTEM = """\
 - 多篇引用用分号分隔：[标题1; 标题2]
 - 标题必须与检索到的论文片段中显示的**完整标题**完全一致，不要缩写或修改
 - 文献引用禁止使用圆括号引用格式如 (Author et al., Year)，必须用方括号 [论文标题]
+- 每一段都必须至少有一个引用标注，没有引用支撑的段落不要写
+- 如果你写了某个具体数据、方法名称或实验结论，必须标注来源论文；无法标注来源的内容直接删除
+- 禁止使用你自己的知识补充内容，只能使用检索片段中明确出现的信息
 - 学术综述体，段落式论述，注重论文间的对比、联系和发展脉络
 - 每轮输出的 draft 是当前最佳版本（完善上一轮，不是追加）
 - 若检索内容不足以支撑某个子节，简短说明"相关研究有限"
+- 全文markdown格式，公式请用$$符号包裹
 - 当你认为内容已充分覆盖大纲要求，设 complete=true
+
 
 ## 写作风格要求
 - 严格按照文献综述的风格写作，应该先描述技术/方法/发现，再在句末标注引用
@@ -123,6 +128,7 @@ class WriterAgent(SubAgentBase):
         outline_text: str = params["outline_text"]
         adjacent_context: str = params.get("adjacent_context", "")
         feedback: str = params.get("feedback", "")
+        available_papers: list[dict] = params.get("available_papers", [])
 
         run_dir = Path(task.run_dir)
         retriever = Retriever(
@@ -150,12 +156,16 @@ class WriterAgent(SubAgentBase):
             adjacent_block = f"## 相邻章节参考（保持连贯性）\n{adjacent_context[:1000]}\n\n" if adjacent_context else ""
             feedback_block = f"## 审核反馈\n{feedback}\n\n请根据反馈修改 draft。\n\n" if feedback else ""
             previous_draft_block = draft if draft else "（首轮，尚无草稿）"
+            papers_block = ""
+            if available_papers:
+                papers_list = "\n".join(f"- {p['title']}：{p['overview']}" for p in available_papers)
+                papers_block = f"## 可用论文列表（请尽量全部引用，通过 queries 检索它们）\n{papers_list}\n\n"
 
             human_content = f"""\
 ## 章节大纲
 {outline_text}
 
-{adjacent_block}## 本轮检索到的论文片段
+{adjacent_block}{papers_block}## 本轮检索到的论文片段
 {chunks_text}
 
 ## 你上一轮的草稿

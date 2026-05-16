@@ -40,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
   PM "vision transformers" -n 10
         """,
     )
-    parser.add_argument("question", help="研究课题")
-    parser.add_argument("-n", "--num-papers", type=int, default=20,
+    parser.add_argument("question", nargs="?", default=None, help="研究课题")
+    parser.add_argument("-n", "--num-papers", type=int, default=50,
                         help="目标参考文献总数（默认 20）")
     parser.add_argument("--out", default=None,
                         help="运行输出目录；不传则自动生成 runs/{时间戳}-{slug}/")
@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="从已有运行目录恢复，指定起始阶段（如 build_index、write_sections）")
     parser.add_argument("--skip-review", action="store_true",
                         help="跳过 reviewer 评审阶段，writer 写完直接进入 polish")
+    parser.add_argument("--pdf", action="store_true",
+                        help="运行完成后自动将 survey.md 转为 PDF")
+    parser.add_argument("--to-pdf", default=None, metavar="MD_FILE",
+                        help="单独将指定 md 文件转为 PDF（不运行 pipeline）")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="开启 DEBUG 日志")
     return parser
@@ -167,6 +171,16 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Handle --to-pdf: standalone conversion, no pipeline
+    if args.to_pdf:
+        from papermind.pdf_export import md_to_pdf
+        pdf_path = md_to_pdf(args.to_pdf)
+        print(f"PDF 已生成: {pdf_path}")
+        return
+
+    if not args.question:
+        parser.error("请提供研究课题（或使用 --to-pdf 转换已有文件）")
+
     run_dir = _resolve_run_dir(args.out, args.question)
     logger.info("PaperMind 启动")
     logger.info("研究课题: %s", args.question)
@@ -174,6 +188,14 @@ def main():
     logger.info("运行目录: %s", run_dir)
 
     asyncio.run(_run_pipeline(args.question, run_dir, num_papers=args.num_papers, resume_from=args.resume, skip_review=args.skip_review))
+
+    # Auto PDF export if --pdf flag is set
+    if args.pdf:
+        survey_path = run_dir / "survey.md"
+        if survey_path.exists():
+            from papermind.pdf_export import md_to_pdf
+            pdf_path = md_to_pdf(survey_path)
+            print(f"PDF 已生成: {pdf_path}")
 
     print(f"\n{'=' * 60}")
     print("PaperMind 完成")
@@ -184,6 +206,9 @@ def main():
     survey_path = run_dir / "survey.md"
     if survey_path.exists():
         print(f"综述:     {survey_path}")
+    pdf_path = run_dir / "survey.pdf"
+    if pdf_path.exists():
+        print(f"PDF:      {pdf_path}")
     print(f"{'=' * 60}")
 
 

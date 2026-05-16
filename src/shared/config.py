@@ -58,6 +58,11 @@ class Config:
     reviewer_timeout: int = field(default_factory=lambda: int(os.getenv("REVIEWER_TIMEOUT", "300")))
     polisher_timeout: int = field(default_factory=lambda: int(os.getenv("POLISHER_TIMEOUT", "300")))
 
+    # Final review LLM (separate model for global polish)
+    review_api_key: str = field(default_factory=lambda: os.getenv("REVIEW_API_KEY", ""))
+    review_base_url: str = field(default_factory=lambda: os.getenv("REVIEW_BASE_URL", ""))
+    review_model: str = field(default_factory=lambda: os.getenv("REVIEW_MODEL", ""))
+
     default_target: int = 30
     workers_per_round: int = 1
     db_path: str = ""

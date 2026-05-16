@@ -3,7 +3,7 @@
 Flow:
   explore_directions → synthesize_outline → research_sections → check_coverage
     → build_index → write_sections (includes review loop)
-    → polish_sections → check_consistency → merge_final → END
+    → polish_sections → check_consistency → final_review → merge_final → END
 """
 
 import logging

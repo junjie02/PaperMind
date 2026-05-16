@@ -45,5 +45,6 @@ class PaperMindState(TypedDict, total=False):
     # ── Phase 6: Polish ────────────────────────────────────────────────────
     polished_sections: dict[str, str]
     consistency_report: dict
+    reviewed_text: str
     final_output: str
     output_path: str
